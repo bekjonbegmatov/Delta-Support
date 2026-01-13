@@ -6,6 +6,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15+-blue)](https://www.postgresql.org/)
 [![Python](https://img.shields.io/badge/Python-3.11+-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+<img width="1024" height="1024" alt="stels" src="https://github.com/user-attachments/assets/633966b4-e0af-4144-9f3b-65031cfb22ac" />
 
 ## 📋 Описание
 
