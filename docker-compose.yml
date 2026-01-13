@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: stels-support-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stels_support}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stels_support_password}
+      POSTGRES_DB: ${POSTGRES_DB:-stels_support}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - stels-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stels_support}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: stels-support-redis
+    command: >
+      sh -c "
+      if [ -n \"$$REDIS_PASSWORD\" ]; then
+        redis-server --requirepass \"$$REDIS_PASSWORD\"
+      else
+        redis-server
+      fi
+      "
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - stels-network
+    restart: unless-stopped
+    healthcheck:
+      test: >
+        sh -c "
+        if [ -n \"$$REDIS_PASSWORD\" ]; then
+          redis-cli -a \"$$REDIS_PASSWORD\" ping
+        else
+          redis-cli ping
+        fi
+        "
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stels-support-app
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - AI_SUPPORT_ENABLED=${AI_SUPPORT_ENABLED}
+      - AI_SUPPORT_API_TYPE=${AI_SUPPORT_API_TYPE}
+      - AI_SUPPORT_API_KEY=${AI_SUPPORT_API_KEY}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - APP_PORT=${APP_PORT:-8080}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - PROJECT_NAME=${PROJECT_NAME}
+      - PROJECT_DESCRIPTION=${PROJECT_DESCRIPTION}
+      - PROJECT_WEBSITE=${PROJECT_WEBSITE}
+      - PROJECT_BOT_LINK=${PROJECT_BOT_LINK}
+      - PROJECT_OWNER_CONTACTS=${PROJECT_OWNER_CONTACTS}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS}
+      - TELEGRAM_MANAGER_IDS=${TELEGRAM_MANAGER_IDS}
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - stels-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  stels-network:
+    driver: bridge
+  # Внешняя сеть для подключения к другим контейнерам (раскомментируйте если нужно)
+  # external_network:
+  #   external: true
+  #   name: remnawave-network  # замените на имя сети где находится ваша БД
