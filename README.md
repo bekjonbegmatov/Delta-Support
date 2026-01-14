@@ -1,6 +1,6 @@
 # 🛡️ StealthNET VPN — Система управления VPN-бизнесом
 
-<img width="512" height="512" alt="stels" src="https://github.com/user-attachments/assets/633966b4-e0af-4144-9f3b-65031cfb22ac" />
+<center><img width="512" height="512" alt="stels" src="https://github.com/user-attachments/assets/633966b4-e0af-4144-9f3b-65031cfb22ac" /></center>
 
 **📢 Присоединяйтесь к нашему сообществу:** [Telegram группа](https://t.me/stealthnet_group)
 
