@@ -61,6 +61,8 @@ class Config(BaseSettings):
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_admin_ids: str = Field(default="", alias="TELEGRAM_ADMIN_IDS")
     telegram_manager_ids: str = Field(default="", alias="TELEGRAM_MANAGER_IDS")
+    telegram_group_mode: bool = Field(default=False, alias="TELEGRAM_GROUP_MODE")
+    telegram_support_group_id: Optional[int] = Field(default=None, alias="TELEGRAM_SUPPORT_GROUP_ID")
     
     # Project Databases
     project_db_1: Optional[str] = Field(default=None, alias="PROJECT_DB_1")

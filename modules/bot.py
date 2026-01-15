@@ -3,7 +3,11 @@
 """
 
 import asyncio
+import json
+import redis
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -29,10 +33,32 @@ class SupportBot:
         self.db = database
         self.ai = AISupport(config)
         self.application = None
+        self.redis = None
+        self._group_id = None
+        try:
+            from chatgpt_md_converter import telegram_format as _md_to_html
+            self._md_to_html = _md_to_html
+        except Exception:
+            self._md_to_html = lambda t: html.escape(t or "")
     
     async def initialize(self):
         """Инициализация бота"""
         self.application = Application.builder().token(self.config.telegram_bot_token).build()
+        try:
+            self.redis = redis.Redis(
+                host=self.config.redis_host,
+                port=self.config.redis_port,
+                password=self.config.redis_password,
+                decode_responses=True,
+                socket_keepalive=True,
+            )
+            self.redis.ping()
+            logger.info("Redis connected")
+        except Exception as e:
+            logger.warning(f"Redis connection failed: {e}")
+        if self.config.telegram_group_mode and self.config.telegram_support_group_id:
+            self._group_id = self.config.telegram_support_group_id
+            logger.info(f"Group mode enabled. Support group: {self._group_id}")
         
         # Регистрация обработчиков
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -40,7 +66,16 @@ class SupportBot:
         self.application.add_handler(CommandHandler("chats", self.chats_command))
         self.application.add_handler(CommandHandler("close", self.close_chat_command))
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(MessageHandler(filters.StatusUpdate.ALL, self.handle_service_update))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.VIDEO, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.AUDIO, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.VOICE, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.VIDEO_NOTE, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.Sticker.ALL, self.handle_any_message))
+        self.application.add_handler(MessageHandler(filters.ANIMATION, self.handle_any_message))
         
         logger.info("Bot handlers registered")
     
@@ -297,9 +332,29 @@ class SupportBot:
         user_id = update.effective_user.id
         
         if user_id not in self.config.get_all_staff_ids():
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
             return
         
+        # Режим группы: /close без аргументов — закрыть текущий топик и вернуть ИИ
+        if self._group_id and update.effective_chat and update.effective_chat.id == self._group_id and not context.args:
+            thread_id = update.message.message_thread_id if update.message else None
+            if not thread_id:
+                await update.message.reply_text("❌ Команда должна выполняться внутри топика форума.")
+                return
+            chat_id = None
+            if self.redis:
+                cid = self.redis.get(f"group_topic:thread:{thread_id}")
+                if cid:
+                    try:
+                        chat_id = int(cid)
+                    except:
+                        chat_id = None
+            if not chat_id:
+                await update.message.reply_text("❌ Топик не привязан к чату клиента.")
+                return
+            await self._reopen_chat_ai(chat_id, user_id, thread_id, update)
+            return
+        
+        # Обычный режим: /close <chat_id> — полностью закрыть чат
         if not context.args:
             await update.message.reply_text("❌ Использование: /close <chat_id>")
             return
@@ -379,6 +434,31 @@ class SupportBot:
             )
         except Exception as e:
             logger.error(f"Error notifying user about closed chat: {e}")
+
+    async def _reopen_chat_ai(self, chat_id: int, user_id: int, thread_id: Optional[int], update: Update):
+        """Завершить сессию менеджера в топике группы и вернуть ИИ в активный режим"""
+        chat = await self.db.get_chat_by_id(chat_id)
+        if not chat:
+            await update.message.reply_text("❌ Чат не найден.")
+            return
+        await self.db.update_chat_status(chat_id, "active", manager_id=None)
+        try:
+            await self.application.bot.send_message(
+                chat_id=chat.user_id,
+                text="👨‍💼 Менеджер завершил сессию. Теперь вам помогает 🤖 AI-поддержка."
+            )
+        except Exception as e:
+            logger.warning(f"Failed to notify user about AI reactivation: {e}")
+        try:
+            await update.message.reply_text(f"✅ Чат #{chat_id}: ИИ активирован, тема зелёная до нового сообщения клиента.")
+        except Exception:
+            pass
+        if self.redis:
+            try:
+                self.redis.delete(f"manager_active_chat:{user_id}")
+            except Exception:
+                pass
+        await self._edit_group_topic_status(chat, role_hint=None)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик нажатий на кнопки"""
@@ -685,6 +765,37 @@ class SupportBot:
                 pass
             return
         
+        if self._group_id:
+            try:
+                thread_id = await self._ensure_group_topic(chat)
+                if thread_id:
+                    name = f"{self._status_emoji(chat.status, 'client')} {chat.first_name or 'Пользователь'} ({chat.user_id}) Ожидает менеджера"
+                    try:
+                        await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=thread_id, name=name)
+                    except Exception as e:
+                        if any(s in str(e).lower() for s in ["topic_deleted", "thread not found", "invalid thread"]):
+                            thread_id = await self._recreate_group_topic(chat, "client")
+                            if thread_id:
+                                await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=thread_id, name=name)
+                        else:
+                            raise
+                    base = f"🟡 Пользователь запросил подключение менеджера\nПользователь: @{chat.username or 'N/A'}\nID: {chat.user_id}\nЧат: #{chat.id}"
+                    summary = None
+                    try:
+                        messages = await self.db.get_chat_messages(chat_id, limit=10)
+                        last_user = next((m.content for m in reversed(messages) if m.message_type == "user"), None)
+                        if last_user and self.config.ai_support_enabled:
+                            prompt = f"Кратко, одной фразой опиши, чего хочет пользователь: {last_user}"
+                            ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
+                            hist = [{"role":"user" if m.message_type=="user" else "assistant","message":m.content} for m in messages]
+                            summary = await self.ai.get_ai_answer(prompt, ctx, hist)
+                    except Exception as e:
+                        logger.warning(f"Failed to build AI summary: {e}")
+                    text = base if not summary else f"{base}\nКратко: {summary}"
+                    await self.application.bot.send_message(chat_id=self._group_id, text=self._md_to_html(text), message_thread_id=thread_id, disable_notification=False, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.warning(f"Failed to update group topic on manager request: {e}")
+        
         # Отправляем уведомления всем менеджерам и админам
         staff_ids = self.config.get_all_staff_ids()
         
@@ -812,3 +923,428 @@ class SupportBot:
             await query.edit_message_text(welcome_text, reply_markup=reply_markup)
         except BadRequest:
             pass
+    
+    async def handle_service_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg or not self._group_id or not update.effective_chat or update.effective_chat.id != self._group_id:
+            return
+        if (getattr(msg, "is_topic_message", False) and (
+            getattr(msg, "forum_topic_created", None) is not None or
+            getattr(msg, "forum_topic_edited", None) is not None or
+            getattr(msg, "forum_topic_closed", None) is not None or
+            getattr(msg, "forum_topic_reopened", None) is not None
+        )) or getattr(msg, "new_chat_title", None) is not None:
+            try:
+                await self.application.bot.delete_message(chat_id=self._group_id, message_id=msg.message_id)
+                logger.info(f"Deleted forum service message {msg.message_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete forum service message: {e}")
+
+    def _extract_message_info(self, update: Update):
+        msg = update.message
+        if msg is None:
+            return None
+        if msg.sticker:
+            return {"kind": "sticker", "text": msg.caption or "", "file_id": msg.sticker.file_id, "message_id": msg.message_id}
+        if msg.animation:
+            return {"kind": "animation", "text": msg.caption or "", "file_id": msg.animation.file_id, "message_id": msg.message_id}
+        if msg.text and not msg.caption:
+            return {"kind": "text", "text": msg.text, "file_id": None, "message_id": msg.message_id}
+        if msg.photo:
+            return {"kind": "photo", "text": msg.caption or "", "file_id": msg.photo[-1].file_id, "message_id": msg.message_id}
+        if msg.video:
+            return {"kind": "video", "text": msg.caption or "", "file_id": msg.video.file_id, "message_id": msg.message_id}
+        if msg.audio:
+            return {"kind": "audio", "text": msg.caption or "", "file_id": msg.audio.file_id, "message_id": msg.message_id}
+        if msg.voice:
+            return {"kind": "voice", "text": msg.caption or "", "file_id": msg.voice.file_id, "message_id": msg.message_id}
+        if msg.document:
+            return {"kind": "document", "text": msg.caption or "", "file_id": msg.document.file_id, "message_id": msg.message_id}
+        if msg.video_note:
+            return {"kind": "video_note", "text": "", "file_id": msg.video_note.file_id, "message_id": msg.message_id}
+        return {"kind": "unknown", "text": msg.caption or msg.text or "", "file_id": None, "message_id": msg.message_id}
+
+    def _store_reply_map(self, manager_id: int, manager_message_id: int, client_chat_id: int, client_message_id: int, chat_id: int):
+        if not self.redis:
+            return
+        key = f"reply_map:{manager_id}:{manager_message_id}"
+        self.redis.setex(key, 7 * 24 * 3600, json.dumps({"client_chat_id": client_chat_id, "client_message_id": client_message_id, "chat_id": chat_id}))
+
+    def _get_reply_map(self, manager_id: int, replied_message_id: int):
+        if not self.redis:
+            return None
+        key = f"reply_map:{manager_id}:{replied_message_id}"
+        val = self.redis.get(key)
+        if not val:
+            return None
+        try:
+            return json.loads(val)
+        except Exception:
+            return None
+
+    def _set_manager_active_chat(self, manager_id: int, chat_id: int):
+        if not self.redis:
+            return
+        self.redis.setex(f"manager_active_chat:{manager_id}", 24 * 3600, str(chat_id))
+
+    def _get_manager_active_chat(self, manager_id: int) -> Optional[int]:
+        if not self.redis:
+            return None
+        val = self.redis.get(f"manager_active_chat:{manager_id}")
+        try:
+            return int(val) if val else None
+        except Exception:
+            return None
+
+    async def _save_message_to_db(self, chat_id: int, user_id: int, info: dict, role: str):
+        text = info.get("text") or ""
+        kind = info.get("kind") or "text"
+        prefix = {
+            "text": "",
+            "photo": "[photo] ",
+            "video": "[video] ",
+            "audio": "[audio] ",
+            "voice": "[voice] ",
+            "document": "[document] ",
+            "video_note": "[video_note] ",
+        }.get(kind, "")
+        content = f"{prefix}{text}".strip()
+        await self.db.add_message(chat_id, user_id, content, role)
+
+    async def _send_to_client(self, client_chat_id: int, info: dict):
+        header = await self.application.bot.send_message(chat_id=client_chat_id, text="👨‍💼 Менеджер поддержки")
+        kind = info["kind"]
+        text = info.get("text") or ""
+        file_id = info.get("file_id")
+        if kind == "text":
+            await self.application.bot.send_message(chat_id=client_chat_id, text=self._md_to_html(text), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "photo":
+            await self.application.bot.send_photo(chat_id=client_chat_id, photo=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "video":
+            await self.application.bot.send_video(chat_id=client_chat_id, video=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "audio":
+            await self.application.bot.send_audio(chat_id=client_chat_id, audio=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "voice":
+            await self.application.bot.send_voice(chat_id=client_chat_id, voice=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "document":
+            await self.application.bot.send_document(chat_id=client_chat_id, document=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        elif kind == "video_note":
+            await self.application.bot.send_video_note(chat_id=client_chat_id, video_note=file_id, reply_to_message_id=header.message_id)
+        elif kind == "sticker":
+            await self.application.bot.send_sticker(chat_id=client_chat_id, sticker=file_id, reply_to_message_id=header.message_id)
+        elif kind == "animation":
+            await self.application.bot.send_animation(chat_id=client_chat_id, animation=file_id, caption=(self._md_to_html(text) if text else None), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+        else:
+            await self.application.bot.send_message(chat_id=client_chat_id, text=self._md_to_html(text or "Сообщение"), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
+
+    def _status_emoji(self, status: str, role_hint: Optional[str] = None) -> str:
+        if role_hint == "client":
+            return "🔴"
+        if role_hint == "manager":
+            return "🟡"
+        if role_hint == "ai":
+            return "🤖"
+        return "🟢"
+
+    async def _ensure_group_topic(self, chat) -> Optional[int]:
+        if not self._group_id:
+            return None
+        thread_key = f"group_topic:chat:{chat.id}"
+        thread_id = self.redis.get(thread_key) if self.redis else None
+        if thread_id:
+            try:
+                return int(thread_id)
+            except:
+                pass
+        name = f"{self._status_emoji(chat.status)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+        try:
+            topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
+            thread_id = getattr(topic, "message_thread_id", None)
+        except Exception as e:
+            logger.error(f"Failed to create forum topic: {e}")
+            thread_id = None
+        if thread_id and self.redis:
+            self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
+            self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
+        return thread_id
+    
+    async def _recreate_group_topic(self, chat, role_hint: Optional[str] = None) -> Optional[int]:
+        name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+        try:
+            topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
+            thread_id = getattr(topic, "message_thread_id", None)
+        except Exception as e:
+            logger.error(f"Failed to recreate forum topic: {e}")
+            return None
+        if self.redis and thread_id:
+            self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
+            self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
+            self.redis.delete(f"group_topic:pin:{thread_id}")
+        return thread_id
+
+    async def _edit_group_topic_status(self, chat, role_hint: Optional[str] = None):
+        if not self._group_id or not self.redis:
+            return
+        thread_id = self.redis.get(f"group_topic:chat:{chat.id}")
+        if not thread_id:
+            return
+        try:
+            name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+            await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(thread_id), name=name)
+        except Exception as e:
+            if any(s in str(e).lower() for s in ["topic_deleted", "thread not found", "invalid thread"]):
+                new_thread = await self._recreate_group_topic(chat, role_hint)
+                if new_thread:
+                    try:
+                        name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+                        await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(new_thread), name=name)
+                    except Exception as e2:
+                        logger.warning(f"Failed to edit recreated forum topic: {e2}")
+            else:
+                logger.warning(f"Failed to edit forum topic: {e}")
+
+    async def _duplicate_to_group(self, chat, user, info: dict, update: Update, role_hint: Optional[str] = None):
+        thread_id = await self._ensure_group_topic(chat)
+        if not thread_id:
+            return
+        try:
+            mute = chat.status != "waiting_manager"
+            pin_key = f"group_topic:pin:{thread_id}"
+            pinned_id = self.redis.get(pin_key) if self.redis else None
+            reply_to_id = None
+            if not pinned_id:
+                full = []
+                full.append(f"👤 Клиент: @{user.username}" if user.username else f"👤 Клиент: {user.first_name or 'Клиент'}")
+                full.append(f"🆔 ID: {chat.id}")
+                full.append(f"UID: {chat.user_id}")
+                text_full = " | ".join(full)
+                header = await self.application.bot.send_message(chat_id=self._group_id, text=text_full, message_thread_id=thread_id, disable_notification=True)
+                try:
+                    await self.application.bot.pin_chat_message(chat_id=self._group_id, message_id=header.message_id, disable_notification=True)
+                except Exception as e:
+                    logger.warning(f"Failed to pin header: {e}")
+                if self.redis:
+                    self.redis.set(pin_key, str(header.message_id))
+                reply_to_id = header.message_id
+            else:
+                try:
+                    reply_to_id = int(pinned_id)
+                except Exception:
+                    reply_to_id = None
+            copied = await self.application.bot.copy_message(chat_id=self._group_id, from_chat_id=user.id, message_id=info["message_id"], message_thread_id=thread_id, reply_to_message_id=reply_to_id, disable_notification=mute)
+            if self.redis:
+                self.redis.setex(f"group_reply:{self._group_id}:{copied.message_id}", 7 * 24 * 3600, json.dumps({"client_chat_id": chat.user_id, "client_message_id": info["message_id"], "chat_id": chat.id}))
+                if reply_to_id:
+                    self.redis.setex(f"group_reply:{self._group_id}:{reply_to_id}", 7 * 24 * 3600, json.dumps({"client_chat_id": chat.user_id, "client_message_id": info["message_id"], "chat_id": chat.id}))
+            await self._edit_group_topic_status(chat, role_hint)
+        except Exception as e:
+            if any(s in str(e).lower() for s in ["topic_deleted", "message thread", "thread not found", "invalid thread"]):
+                new_thread = await self._recreate_group_topic(chat, role_hint)
+                if not new_thread:
+                    logger.error(f"Failed to duplicate to group: {e}")
+                    return
+                try:
+                    mute = chat.status != "waiting_manager"
+                    pin_key = f"group_topic:pin:{new_thread}"
+                    pinned_id = self.redis.get(pin_key) if self.redis else None
+                    reply_to_id = None
+                    if not pinned_id:
+                        full = []
+                        full.append(f"👤 Клиент: @{user.username}" if user.username else f"👤 Клиент: {user.first_name or 'Клиент'}")
+                        full.append(f"🆔 ID: {chat.id}")
+                        full.append(f"UID: {chat.user_id}")
+                        text_full = " | ".join(full)
+                        header = await self.application.bot.send_message(chat_id=self._group_id, text=text_full, message_thread_id=new_thread, disable_notification=True)
+                        try:
+                            await self.application.bot.pin_chat_message(chat_id=self._group_id, message_id=header.message_id, disable_notification=True)
+                        except Exception as e2:
+                            logger.warning(f"Failed to pin header: {e2}")
+                        if self.redis:
+                            self.redis.set(pin_key, str(header.message_id))
+                        reply_to_id = header.message_id
+                    else:
+                        try:
+                            reply_to_id = int(pinned_id)
+                        except Exception:
+                            reply_to_id = None
+                    copied = await self.application.bot.copy_message(chat_id=self._group_id, from_chat_id=user.id, message_id=info["message_id"], message_thread_id=new_thread, reply_to_message_id=reply_to_id, disable_notification=mute)
+                    if self.redis:
+                        self.redis.setex(f"group_reply:{self._group_id}:{copied.message_id}", 7 * 24 * 3600, json.dumps({"client_chat_id": chat.user_id, "client_message_id": info["message_id"], "chat_id": chat.id}))
+                        if reply_to_id:
+                            self.redis.setex(f"group_reply:{self._group_id}:{reply_to_id}", 7 * 24 * 3600, json.dumps({"client_chat_id": chat.user_id, "client_message_id": info["message_id"], "chat_id": chat.id}))
+                    await self._edit_group_topic_status(chat, role_hint)
+                except Exception as e3:
+                    logger.error(f"Failed to duplicate to group after recreate: {e3}")
+            else:
+                logger.error(f"Failed to duplicate to group: {e}")
+
+    async def _forward_to_manager(self, chat, user, info: dict, update: Update):
+        if self._group_id:
+            await self._duplicate_to_group(chat, user, info, update, role_hint="client")
+            try:
+                await update.message.reply_text("✅ Ваше сообщение отправлено в поддержку. Ожидайте ответа.")
+            except Exception:
+                pass
+            return True
+        manager_id = chat.manager_id
+        if not manager_id:
+            return False
+        signature = f"👤 Клиент: @{user.username}" if user.username else f"👤 Клиент: {user.first_name or 'Клиент'}"
+        signature += f" 🆔 ID: {chat.id}"
+        header = await self.application.bot.send_message(chat_id=manager_id, text=signature)
+        copied = await self.application.bot.copy_message(chat_id=manager_id, from_chat_id=user.id, message_id=info["message_id"], reply_to_message_id=header.message_id)
+        self._store_reply_map(manager_id, copied.message_id, chat.user_id, info["message_id"], chat.id)
+        self._store_reply_map(manager_id, header.message_id, chat.user_id, info["message_id"], chat.id)
+        self._set_manager_active_chat(manager_id, chat.id)
+        try:
+            await update.message.reply_text("✅ Ваше сообщение отправлено менеджеру. Ожидайте ответа.")
+        except Exception:
+            pass
+        return True
+
+    async def handle_any_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        user_id = user.id
+        info = self._extract_message_info(update)
+        if not info:
+            return
+        if self._group_id and update.effective_chat and update.effective_chat.id == self._group_id:
+            thread_id = update.message.message_thread_id if update.message else None
+            if not thread_id:
+                return
+            msg = update.message
+            if (getattr(msg, "is_topic_message", False) and (
+                getattr(msg, "forum_topic_created", None) is not None or
+                getattr(msg, "forum_topic_edited", None) is not None or
+                getattr(msg, "forum_topic_closed", None) is not None or
+                getattr(msg, "forum_topic_reopened", None) is not None
+            )) or getattr(msg, "new_chat_title", None):
+                try:
+                    await self.application.bot.delete_message(chat_id=self._group_id, message_id=msg.message_id)
+                except Exception as e:
+                    logger.warning(f"Failed to delete forum service message: {e}")
+                return
+            if user_id not in self.config.get_all_staff_ids():
+                return
+            replied = update.message.reply_to_message.message_id if update.message and update.message.reply_to_message else None
+            route = None
+            if replied and self.redis:
+                val = self.redis.get(f"group_reply:{self._group_id}:{replied}")
+                if val:
+                    try:
+                        route = json.loads(val)
+                    except:
+                        route = None
+            client_chat_id = None
+            chat_id = None
+            if route:
+                client_chat_id = route["client_chat_id"]
+                chat_id = route["chat_id"]
+            else:
+                if self.redis:
+                    cid = self.redis.get(f"group_topic:thread:{thread_id}")
+                    chat_id = int(cid) if cid else None
+                if chat_id:
+                    chat = await self.db.get_chat_by_id(chat_id)
+                    client_chat_id = chat.user_id if chat else None
+            if not client_chat_id or not chat_id:
+                await update.message.reply_text("❌ Не найден связанный клиент для этого топика.")
+                return
+            try:
+                await self._send_to_client(client_chat_id, info)
+                await self._save_message_to_db(chat_id, user_id, info, "manager")
+                await self._edit_group_topic_status(await self.db.get_chat_by_id(chat_id), role_hint="manager")
+            except Exception as e:
+                logger.error(f"Error routing manager message from group: {e}")
+                await update.message.reply_text("❌ Ошибка при отправке клиенту")
+            return
+        if user_id in self.config.get_all_staff_ids():
+            replied = update.message.reply_to_message.message_id if update.message and update.message.reply_to_message else None
+            route = self._get_reply_map(user_id, replied) if replied else None
+            if route:
+                client_chat_id = route["client_chat_id"]
+                chat_id = route["chat_id"]
+                try:
+                    await self._send_to_client(client_chat_id, info)
+                    await self._save_message_to_db(chat_id, user_id, info, "manager")
+                    await update.message.reply_text(f"✅ Сообщение отправлено пользователю (Чат #{chat_id})")
+                except Exception as e:
+                    logger.error(f"Error routing manager reply: {e}")
+                    await update.message.reply_text("❌ Ошибка при отправке сообщения")
+                return
+            active_chat_id = self._get_manager_active_chat(user_id)
+            manager_chat = None
+            if not active_chat_id:
+                chats = await self.db.get_all_chats(status="waiting_manager")
+                for c in chats:
+                    if c.manager_id == user_id:
+                        manager_chat = c
+                        break
+            else:
+                manager_chat = await self.db.get_chat_by_id(active_chat_id)
+            if manager_chat:
+                try:
+                    await self._send_to_client(manager_chat.user_id, info)
+                    await self._save_message_to_db(manager_chat.id, user_id, info, "manager")
+                    await update.message.reply_text(f"✅ Сообщение отправлено пользователю (Чат #{manager_chat.id})")
+                except Exception as e:
+                    logger.error(f"Error sending message from manager to user: {e}")
+                    await update.message.reply_text("❌ Ошибка при отправке сообщения")
+            else:
+                await update.message.reply_text("💬 Используйте команду /chats и подключитесь к чату, затем ответьте на пересланное сообщение.")
+            return
+        chat = await self.db.get_chat_by_user_id(user_id)
+        if not chat:
+            chat = await self.db.create_chat(user_id=user_id, username=user.username, first_name=user.first_name, last_name=user.last_name)
+        await self._save_message_to_db(chat.id, user_id, info, "user")
+        if chat.status == "waiting_manager":
+            try:
+                await self._forward_to_manager(chat, user, info, update)
+            except Exception as e:
+                logger.error(f"Error forwarding message to manager: {e}")
+                try:
+                    await update.message.reply_text("✅ Ваше сообщение сохранено. Менеджер скоро ответит.")
+                except Exception:
+                    pass
+            return
+        if self._group_id:
+            try:
+                await self._duplicate_to_group(chat, user, info, update, role_hint="client")
+            except Exception as e:
+                logger.error(f"Failed to duplicate client message to group: {e}")
+        if info["kind"] == "text":
+            chat_messages = await self.db.get_chat_messages(chat.id, limit=20)
+            chat_history = [{"role": "user" if msg.message_type == "user" else "assistant", "message": msg.content} for msg in chat_messages]
+            context_info = {"user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
+            ai_response = await self.ai.get_ai_answer(info["text"], context_info, chat_history)
+            if ai_response:
+                await self.db.add_message(chat.id, user_id, ai_response, "ai")
+                if any(keyword in ai_response.lower() for keyword in ["менеджер", "пригласить", "подключить"]):
+                    keyboard = [[InlineKeyboardButton("Да, пригласите менеджера", callback_data=f"request_manager_{chat.id}")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(self._md_to_html(ai_response), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+                else:
+                    await update.message.reply_text(self._md_to_html(ai_response), parse_mode=ParseMode.HTML)
+                if self._group_id:
+                    try:
+                        thread_id = await self._ensure_group_topic(chat)
+                        if thread_id:
+                            mute = chat.status != "waiting_manager"
+                            header = await self.application.bot.send_message(chat_id=self._group_id, text="🤖 Ответ ИИ", message_thread_id=thread_id, disable_notification=mute)
+                            await self.application.bot.send_message(chat_id=self._group_id, text=self._md_to_html(ai_response), message_thread_id=thread_id, reply_to_message_id=header.message_id, disable_notification=mute, parse_mode=ParseMode.HTML)
+                            await self._edit_group_topic_status(chat, role_hint="ai")
+                    except Exception as e:
+                        logger.error(f"Failed to duplicate AI response to group: {e}")
+            else:
+                keyboard = [[InlineKeyboardButton("Пригласить менеджера", callback_data=f"request_manager_{chat.id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text("Извините, я не смог обработать ваш вопрос. Хотите пригласить менеджера в чат?", reply_markup=reply_markup)
+        else:
+            keyboard = [[InlineKeyboardButton("Пригласить менеджера", callback_data=f"request_manager_{chat.id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Сообщение сохранено. Для обработки медиа подключите менеджера.", reply_markup=reply_markup)
+        if self._group_id and info["kind"] != "text":
+            try:
+                await self._duplicate_to_group(chat, user, info, update, role_hint="client")
+            except Exception as e:
+                logger.error(f"Failed to duplicate client media to group: {e}")

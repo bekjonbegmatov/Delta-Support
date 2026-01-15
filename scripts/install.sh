@@ -141,6 +141,15 @@ fi
 read -p "ID администраторов (через запятую): " TELEGRAM_ADMIN_IDS
 read -p "ID менеджеров (через запятую): " TELEGRAM_MANAGER_IDS
 
+read -p "Включить режим группы поддержки (форум-топики)? (y/n) [n]: " ENABLE_GROUP
+ENABLE_GROUP=${ENABLE_GROUP:-n}
+TELEGRAM_GROUP_MODE="false"
+TELEGRAM_SUPPORT_GROUP_ID=""
+if [ "$ENABLE_GROUP" = "y" ] || [ "$ENABLE_GROUP" = "Y" ]; then
+    TELEGRAM_GROUP_MODE="true"
+    read -p "ID Telegram группы (с форумом): " TELEGRAM_SUPPORT_GROUP_ID
+fi
+
 echo ""
 echo "=========================================="
 echo "Настройка базы данных проектов"
@@ -203,6 +212,19 @@ sed -i "s|^AI_SUPPORT_API_KEY=.*|AI_SUPPORT_API_KEY=$AI_API_KEY|" .env
 sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN|" .env
 sed -i "s|^TELEGRAM_ADMIN_IDS=.*|TELEGRAM_ADMIN_IDS=$TELEGRAM_ADMIN_IDS|" .env
 sed -i "s|^TELEGRAM_MANAGER_IDS=.*|TELEGRAM_MANAGER_IDS=$TELEGRAM_MANAGER_IDS|" .env
+
+if grep -q "^TELEGRAM_GROUP_MODE=" .env; then
+    sed -i "s|^TELEGRAM_GROUP_MODE=.*|TELEGRAM_GROUP_MODE=$TELEGRAM_GROUP_MODE|" .env
+else
+    echo "TELEGRAM_GROUP_MODE=$TELEGRAM_GROUP_MODE" >> .env
+fi
+if [ -n "$TELEGRAM_SUPPORT_GROUP_ID" ]; then
+    if grep -q "^TELEGRAM_SUPPORT_GROUP_ID=" .env; then
+        sed -i "s|^TELEGRAM_SUPPORT_GROUP_ID=.*|TELEGRAM_SUPPORT_GROUP_ID=$TELEGRAM_SUPPORT_GROUP_ID|" .env
+    else
+        echo "TELEGRAM_SUPPORT_GROUP_ID=$TELEGRAM_SUPPORT_GROUP_ID" >> .env
+    fi
+fi
 
 sed -i "s|^POSTGRES_USER=.*|POSTGRES_USER=$POSTGRES_USER|" .env
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" .env
