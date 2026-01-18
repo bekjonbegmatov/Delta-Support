@@ -4,12 +4,14 @@
 
 import os
 from typing import List, Optional
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
 
 
 class Config(BaseSettings):
     """Класс конфигурации приложения"""
+
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
     
     # Project info
     project_name: str = Field(default="DELTA-Support", alias="PROJECT_NAME")
@@ -82,9 +84,14 @@ class Config(BaseSettings):
     # JWT
     jwt_secret_key: str = Field(default="", alias="JWT_SECRET_KEY")
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    @field_validator("telegram_support_group_id", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
     
     def get_admin_ids(self) -> List[int]:
         """Получить список ID администраторов"""

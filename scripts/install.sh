@@ -100,15 +100,31 @@ compose_cmd() {
   echo "$D compose"
 }
 
+TTY_IN=""
+if [ -r /dev/tty ]; then
+  TTY_IN="/dev/tty"
+elif [ -t 0 ]; then
+  TTY_IN="/dev/stdin"
+fi
+
+require_tty_or_env() {
+  if [ -n "$TTY_IN" ]; then
+    return
+  fi
+  error "Нет TTY для ввода. Запусти в интерактивной сессии или передай переменные окружения (TELEGRAM_BOT_TOKEN и т.д.)."
+  exit 1
+}
+
 prompt() {
   local msg="$1"
   local def="${2:-}"
   local var
+  require_tty_or_env
   if [ -n "$def" ]; then
-    read -r -p "$msg [$def]: " var
+    read -r -p "$msg [$def]: " var <"$TTY_IN"
     echo "${var:-$def}"
   else
-    read -r -p "$msg: " var
+    read -r -p "$msg: " var <"$TTY_IN"
     echo "$var"
   fi
 }
@@ -116,8 +132,8 @@ prompt() {
 prompt_secret() {
   local msg="$1"
   local var
-  read -r -s -p "$msg: " var
-  echo ""
+  require_tty_or_env
+  read -r -p "$msg: " var <"$TTY_IN"
   echo "$var"
 }
 
@@ -181,47 +197,95 @@ if [ -f .env ]; then
 fi
 cp env.example .env
 
-PROJECT_NAME="$(prompt "Название проекта" "DELTA-Support")"
-PROJECT_DESCRIPTION="$(prompt "Описание проекта" "")"
-PROJECT_WEBSITE="$(prompt "Сайт проекта (если есть)" "")"
-PROJECT_BOT_LINK="$(prompt "Ссылка на бота (если есть)" "")"
-PROJECT_OWNER_CONTACTS="$(prompt "Контакты владельца" "")"
+PROJECT_NAME="${PROJECT_NAME:-}"
+PROJECT_DESCRIPTION="${PROJECT_DESCRIPTION:-}"
+PROJECT_WEBSITE="${PROJECT_WEBSITE:-}"
+PROJECT_BOT_LINK="${PROJECT_BOT_LINK:-}"
+PROJECT_OWNER_CONTACTS="${PROJECT_OWNER_CONTACTS:-}"
+if [ -z "$PROJECT_NAME" ]; then PROJECT_NAME="$(prompt "Название проекта" "DELTA-Support")"; fi
+if [ -z "$PROJECT_DESCRIPTION" ]; then PROJECT_DESCRIPTION="$(prompt "Описание проекта" "")"; fi
+if [ -z "$PROJECT_WEBSITE" ]; then PROJECT_WEBSITE="$(prompt "Сайт проекта (если есть)" "")"; fi
+if [ -z "$PROJECT_BOT_LINK" ]; then PROJECT_BOT_LINK="$(prompt "Ссылка на бота (если есть)" "")"; fi
+if [ -z "$PROJECT_OWNER_CONTACTS" ]; then PROJECT_OWNER_CONTACTS="$(prompt "Контакты владельца" "")"; fi
 
-WEB_PORT="$(prompt "Порт веб-интерфейса" "3030")"
+WEB_PORT="${WEB_PORT:-}"
+if [ -z "$WEB_PORT" ]; then WEB_PORT="$(prompt "Порт веб-интерфейса" "3030")"; fi
 
 say_header "Настройка Telegram"
-TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram Bot Token (обязательно)")"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram Bot Token (обязательно)")"; fi
 if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
   error "TELEGRAM_BOT_TOKEN обязателен."
   exit 1
 fi
-TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"
-TELEGRAM_MANAGER_IDS="$(prompt "ID менеджеров (через запятую)" "")"
+TELEGRAM_ADMIN_IDS="${TELEGRAM_ADMIN_IDS:-}"
+TELEGRAM_MANAGER_IDS="${TELEGRAM_MANAGER_IDS:-}"
+if [ -z "$TELEGRAM_ADMIN_IDS" ]; then TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"; fi
+if [ -z "$TELEGRAM_MANAGER_IDS" ]; then TELEGRAM_MANAGER_IDS="$(prompt "ID менеджеров (через запятую)" "")"; fi
 
-ENABLE_GROUP="$(prompt "Включить режим группы поддержки (форум‑топики)? (y/n)" "n")"
+ENABLE_GROUP="${ENABLE_GROUP:-}"
+if [ -z "$ENABLE_GROUP" ]; then ENABLE_GROUP="$(prompt "Включить режим группы поддержки (форум‑топики)? (y/n)" "n")"; fi
 TELEGRAM_GROUP_MODE="false"
 TELEGRAM_SUPPORT_GROUP_ID=""
 if [ "$ENABLE_GROUP" = "y" ] || [ "$ENABLE_GROUP" = "Y" ]; then
   TELEGRAM_GROUP_MODE="true"
-  TELEGRAM_SUPPORT_GROUP_ID="$(prompt "ID Telegram группы (с форумом)" "")"
+  TELEGRAM_SUPPORT_GROUP_ID="${TELEGRAM_SUPPORT_GROUP_ID:-}"
+  if [ -z "$TELEGRAM_SUPPORT_GROUP_ID" ]; then TELEGRAM_SUPPORT_GROUP_ID="$(prompt "ID Telegram группы (с форумом)" "")"; fi
 fi
 
 say_header "Настройка AI"
-AI_ENABLED="$(prompt "Включить AI поддержку? (y/n)" "y")"
+AI_ENABLED="${AI_ENABLED:-}"
+if [ -z "$AI_ENABLED" ]; then AI_ENABLED="$(prompt "Включить AI поддержку? (y/n)" "y")"; fi
 AI_SUPPORT_ENABLED="false"
 AI_SUPPORT_API_TYPE="groq"
-AI_SUPPORT_API_KEY=""
+AI_SUPPORT_API_KEY="${AI_SUPPORT_API_KEY:-}"
 if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
   AI_SUPPORT_ENABLED="true"
-  AI_TYPE_CHOICE="$(prompt "Тип AI API: 1) Groq  2) Rule-based" "1")"
+  AI_TYPE_CHOICE="${AI_TYPE_CHOICE:-}"
+  if [ -z "$AI_TYPE_CHOICE" ]; then AI_TYPE_CHOICE="$(prompt "Тип AI API: 1) Groq  2) Rule-based" "1")"; fi
   if [ "$AI_TYPE_CHOICE" = "2" ]; then
     AI_SUPPORT_API_TYPE="rule-based"
     AI_SUPPORT_API_KEY=""
   else
     AI_SUPPORT_API_TYPE="groq"
-    AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"
+    if [ -z "$AI_SUPPORT_API_KEY" ]; then AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"; fi
   fi
 fi
+
+sanitize_one_line() {
+  local v="${1:-}"
+  v="${v//$'\r'/}"
+  v="${v//$'\n'/}"
+  echo "$v"
+}
+
+set_dotenv() {
+  local key="$1"
+  local value
+  value="$(sanitize_one_line "${2:-}")"
+  if [ -f .env ] && grep -q "^${key}=" .env; then
+    local escaped
+    escaped="$(printf '%s' "$value" | sed -e 's/[\\&/]/\\&/g')"
+    sed -i "s/^${key}=.*/${key}=${escaped}/" .env
+  else
+    echo "${key}=${value}" >> .env
+  fi
+}
+
+PROJECT_NAME="$(sanitize_one_line "$PROJECT_NAME")"
+PROJECT_DESCRIPTION="$(sanitize_one_line "$PROJECT_DESCRIPTION")"
+PROJECT_WEBSITE="$(sanitize_one_line "$PROJECT_WEBSITE")"
+PROJECT_BOT_LINK="$(sanitize_one_line "$PROJECT_BOT_LINK")"
+PROJECT_OWNER_CONTACTS="$(sanitize_one_line "$PROJECT_OWNER_CONTACTS")"
+TELEGRAM_BOT_TOKEN="$(sanitize_one_line "$TELEGRAM_BOT_TOKEN")"
+TELEGRAM_ADMIN_IDS="$(sanitize_one_line "$TELEGRAM_ADMIN_IDS")"
+TELEGRAM_MANAGER_IDS="$(sanitize_one_line "$TELEGRAM_MANAGER_IDS")"
+TELEGRAM_GROUP_MODE="$(sanitize_one_line "$TELEGRAM_GROUP_MODE")"
+TELEGRAM_SUPPORT_GROUP_ID="$(sanitize_one_line "$TELEGRAM_SUPPORT_GROUP_ID")"
+AI_SUPPORT_ENABLED="$(sanitize_one_line "$AI_SUPPORT_ENABLED")"
+AI_SUPPORT_API_TYPE="$(sanitize_one_line "$AI_SUPPORT_API_TYPE")"
+AI_SUPPORT_API_KEY="$(sanitize_one_line "$AI_SUPPORT_API_KEY")"
+WEB_PORT="$(sanitize_one_line "$WEB_PORT")"
 
 JWT_SECRET_KEY="$(generate_secret)"
 POSTGRES_USER="delta_support"
@@ -229,73 +293,25 @@ POSTGRES_DB="delta_support"
 POSTGRES_PASSWORD="$(generate_secret | tr -d '=+/' | cut -c1-25)"
 DATABASE_URL_CONTAINER="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
 
-export PROJECT_NAME PROJECT_DESCRIPTION PROJECT_WEBSITE PROJECT_BOT_LINK PROJECT_OWNER_CONTACTS
-export AI_SUPPORT_ENABLED AI_SUPPORT_API_TYPE AI_SUPPORT_API_KEY
-export TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_IDS TELEGRAM_MANAGER_IDS TELEGRAM_GROUP_MODE TELEGRAM_SUPPORT_GROUP_ID
-export PROJECT_DB_1 PROJECT_DB_2 PROJECT_DB_3
-export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB JWT_SECRET_KEY WEB_PORT DATABASE_URL_CONTAINER
-
-python3 - <<'PY'
-import os
-import re
-from pathlib import Path
-
-path = Path(".env")
-text = path.read_text(encoding="utf-8")
-
-keys = [
-  "PROJECT_NAME",
-  "PROJECT_DESCRIPTION",
-  "PROJECT_WEBSITE",
-  "PROJECT_BOT_LINK",
-  "PROJECT_OWNER_CONTACTS",
-  "AI_SUPPORT_ENABLED",
-  "AI_SUPPORT_API_TYPE",
-  "AI_SUPPORT_API_KEY",
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_ADMIN_IDS",
-  "TELEGRAM_MANAGER_IDS",
-  "TELEGRAM_GROUP_MODE",
-  "TELEGRAM_SUPPORT_GROUP_ID",
-  "PROJECT_DB_1",
-  "PROJECT_DB_2",
-  "PROJECT_DB_3",
-  "POSTGRES_USER",
-  "POSTGRES_PASSWORD",
-  "POSTGRES_DB",
-  "JWT_SECRET_KEY",
-  "WEB_PORT",
-  "DATABASE_URL_CONTAINER",
-]
-
-def dotenv_quote(value: str) -> str:
-  if value is None:
-    return ""
-  s = str(value)
-  if s == "":
-    return ""
-  needs_quotes = any(ch.isspace() for ch in s) or any(ch in s for ch in ['"', '#'])
-  if not needs_quotes:
-    return s
-  s = s.replace("\\", "\\\\").replace('"', '\\"')
-  return f"\"{s}\""
-
-def set_kv(src: str, key: str, value: str) -> str:
-  pattern = re.compile(rf"^(\\s*{re.escape(key)}\\s*=).*?$", re.M)
-  if value is None:
-    value = ""
-  if pattern.search(src):
-    return pattern.sub(rf"\\1{value}", src)
-  if not src.endswith("\\n"):
-    src += "\\n"
-  return src + f"{key}={value}\\n"
-
-for k in keys:
-  v = os.environ.get(k, "")
-  text = set_kv(text, k, dotenv_quote(v))
-
-path.write_text(text, encoding="utf-8")
-PY
+set_dotenv PROJECT_NAME "$PROJECT_NAME"
+set_dotenv PROJECT_DESCRIPTION "$PROJECT_DESCRIPTION"
+set_dotenv PROJECT_WEBSITE "$PROJECT_WEBSITE"
+set_dotenv PROJECT_BOT_LINK "$PROJECT_BOT_LINK"
+set_dotenv PROJECT_OWNER_CONTACTS "$PROJECT_OWNER_CONTACTS"
+set_dotenv WEB_PORT "$WEB_PORT"
+set_dotenv TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+set_dotenv TELEGRAM_ADMIN_IDS "$TELEGRAM_ADMIN_IDS"
+set_dotenv TELEGRAM_MANAGER_IDS "$TELEGRAM_MANAGER_IDS"
+set_dotenv TELEGRAM_GROUP_MODE "$TELEGRAM_GROUP_MODE"
+set_dotenv TELEGRAM_SUPPORT_GROUP_ID "$TELEGRAM_SUPPORT_GROUP_ID"
+set_dotenv AI_SUPPORT_ENABLED "$AI_SUPPORT_ENABLED"
+set_dotenv AI_SUPPORT_API_TYPE "$AI_SUPPORT_API_TYPE"
+set_dotenv AI_SUPPORT_API_KEY "$AI_SUPPORT_API_KEY"
+set_dotenv POSTGRES_USER "$POSTGRES_USER"
+set_dotenv POSTGRES_PASSWORD "$POSTGRES_PASSWORD"
+set_dotenv POSTGRES_DB "$POSTGRES_DB"
+set_dotenv JWT_SECRET_KEY "$JWT_SECRET_KEY"
+set_dotenv DATABASE_URL_CONTAINER "$DATABASE_URL_CONTAINER"
 
 mkdir -p data logs web/static/uploads/branding
 
