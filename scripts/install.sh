@@ -1,285 +1,332 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# STELS-Support Installation Script
-# Автоматическая установка бота поддержки
+set -euo pipefail
 
-set -e
-
-echo "=========================================="
-echo "STELS-Support Installation Script"
-echo "=========================================="
-echo ""
-
-# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Функция для вывода сообщений
-info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+say_header() {
+  echo "=========================================="
+  echo "$1"
+  echo "=========================================="
+  echo ""
 }
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# Проверка наличия Docker
-if ! command -v docker &> /dev/null; then
-    error "Docker не установлен. Установите Docker и повторите попытку."
-    exit 1
+SUDO=""
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  if need_cmd sudo; then
+    SUDO="sudo"
+  fi
 fi
 
-# Проверка Docker Compose (поддержка обоих вариантов: docker-compose и docker compose)
-DOCKER_COMPOSE_CMD=""
-if command -v docker-compose &> /dev/null; then
-    DOCKER_COMPOSE_CMD="docker-compose"
-    info "Найден docker-compose (legacy)"
-elif docker compose version &> /dev/null; then
-    DOCKER_COMPOSE_CMD="docker compose"
-    info "Найден docker compose (plugin)"
+ensure_base_tools() {
+  if need_cmd apt-get; then
+    $SUDO apt-get update -y
+    $SUDO apt-get install -y ca-certificates curl git
+    if ! need_cmd python3; then
+      $SUDO apt-get install -y python3
+    fi
+    if ! need_cmd openssl; then
+      $SUDO apt-get install -y openssl
+    fi
+    return
+  fi
+  if need_cmd yum; then
+    $SUDO yum install -y ca-certificates curl git python3 openssl
+    return
+  fi
+  if need_cmd apk; then
+    $SUDO apk add --no-cache ca-certificates curl git python3 openssl
+    return
+  fi
+}
+
+ensure_docker() {
+  if need_cmd docker; then
+    return
+  fi
+  say_header "Установка Docker"
+  if [ -z "$SUDO" ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    error "Нужны права root/sudo для установки Docker."
+    exit 1
+  fi
+  ensure_base_tools
+  curl -fsSL https://get.docker.com | $SUDO sh
+  if need_cmd systemctl; then
+    $SUDO systemctl enable --now docker || true
+  fi
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    $SUDO usermod -aG docker "${USER:-$(id -un)}" || true
+  fi
+}
+
+docker_cmd() {
+  if docker info >/dev/null 2>&1; then
+    echo "docker"
+    return
+  fi
+  if [ -n "$SUDO" ]; then
+    echo "sudo docker"
+    return
+  fi
+  echo "docker"
+}
+
+compose_cmd() {
+  local D
+  D="$(docker_cmd)"
+  if $D compose version >/dev/null 2>&1; then
+    echo "$D compose"
+    return
+  fi
+  if need_cmd docker-compose; then
+    if [ -n "$SUDO" ]; then
+      echo "sudo docker-compose"
+      return
+    fi
+    echo "docker-compose"
+    return
+  fi
+  echo "$D compose"
+}
+
+prompt() {
+  local msg="$1"
+  local def="${2:-}"
+  local var
+  if [ -n "$def" ]; then
+    read -r -p "$msg [$def]: " var
+    echo "${var:-$def}"
+  else
+    read -r -p "$msg: " var
+    echo "$var"
+  fi
+}
+
+prompt_secret() {
+  local msg="$1"
+  local var
+  read -r -s -p "$msg: " var
+  echo ""
+  echo "$var"
+}
+
+generate_secret() {
+  if need_cmd python3; then
+    python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+    return
+  fi
+  if need_cmd openssl; then
+    openssl rand -base64 48 | tr -d '\n' | cut -c1-43
+    echo ""
+    return
+  fi
+  date +%s | sha256sum | awk '{print $1}'
+}
+
+REPO_URL="${REPO_URL:-https://github.com/bekjonbegmatov/Delta-Support.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+DEFAULT_DIR="/opt/delta-supportdesk"
+if [ -z "$SUDO" ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  DEFAULT_DIR="${HOME:-/tmp}/delta-supportdesk"
+fi
+INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_DIR}"
+
+say_header "Delta-SupportDesk: автоустановка"
+
+ensure_base_tools
+ensure_docker
+
+COMPOSE="$(compose_cmd)"
+info "Использую команду: $COMPOSE"
+
+say_header "Клонирование репозитория"
+if [ -d "$INSTALL_DIR/.git" ]; then
+  info "Репозиторий уже существует: $INSTALL_DIR"
+  cd "$INSTALL_DIR"
+  git fetch --all --prune
+  git reset --hard "origin/$REPO_BRANCH"
 else
-    error "Docker Compose не установлен. Установите Docker Compose и повторите попытку."
+  if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
+    error "Путь занят файлом: $INSTALL_DIR"
     exit 1
+  fi
+  mkdir -p "$INSTALL_DIR"
+  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
 fi
 
-info "Docker и Docker Compose найдены"
+if [ ! -f env.example ]; then
+  error "env.example не найден в репозитории."
+  exit 1
+fi
 
-# Переход в директорию проекта
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-
-info "Рабочая директория: $PROJECT_DIR"
-
-# Создание .env файла
+say_header "Настройка .env"
 if [ -f .env ]; then
-    warn "Файл .env уже существует. Создаю резервную копию..."
-    cp .env .env.backup.$(date +%Y%m%d_%H%M%S)
+  warn ".env уже существует — создаю резервную копию."
+  cp .env ".env.backup.$(date +%Y%m%d_%H%M%S)"
 fi
+cp env.example .env
 
-# Копирование примера
-if [ -f env.example ]; then
-    cp env.example .env
-    info "Создан файл .env из примера"
-else
-    error "Файл env.example не найден!"
-    exit 1
-fi
+PROJECT_NAME="$(prompt "Название проекта" "DELTA-Support")"
+PROJECT_DESCRIPTION="$(prompt "Описание проекта" "")"
+PROJECT_WEBSITE="$(prompt "Сайт проекта (если есть)" "")"
+PROJECT_BOT_LINK="$(prompt "Ссылка на бота (если есть)" "")"
+PROJECT_OWNER_CONTACTS="$(prompt "Контакты владельца" "")"
 
-echo ""
-echo "=========================================="
-echo "Настройка проекта"
-echo "=========================================="
-echo ""
+WEB_PORT="$(prompt "Порт веб-интерфейса" "3030")"
 
-# Запрос информации о проекте
-read -p "Название проекта [STELS-Support]: " PROJECT_NAME
-PROJECT_NAME=${PROJECT_NAME:-STELS-Support}
-
-read -p "Описание проекта: " PROJECT_DESCRIPTION
-
-read -p "Ссылка на сайт проекта (если есть): " PROJECT_WEBSITE
-
-read -p "Ссылка на бот проекта (если есть): " PROJECT_BOT_LINK
-
-read -p "Контакты владельца проекта: " PROJECT_OWNER_CONTACTS
-
-echo ""
-echo "=========================================="
-echo "Настройка AI"
-echo "=========================================="
-echo ""
-
-read -p "Включить AI поддержку? (y/n) [y]: " AI_ENABLED
-AI_ENABLED=${AI_ENABLED:-y}
-
-if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
-    echo "Выберите тип AI API:"
-    echo "1) Groq (рекомендуется)"
-    echo "2) Rule-based (без внешнего API)"
-    read -p "Ваш выбор [1]: " AI_TYPE_CHOICE
-    AI_TYPE_CHOICE=${AI_TYPE_CHOICE:-1}
-    
-    case $AI_TYPE_CHOICE in
-        1)
-            AI_TYPE="groq"
-            read -p "Введите Groq API ключ: " AI_API_KEY
-            ;;
-        2)
-            AI_TYPE="rule-based"
-            AI_API_KEY=""
-            ;;
-        *)
-            AI_TYPE="groq"
-            read -p "Введите Groq API ключ: " AI_API_KEY
-            ;;
-    esac
-else
-    AI_TYPE="groq"
-    AI_API_KEY=""
-fi
-
-echo ""
-echo "=========================================="
-echo "Настройка Telegram бота"
-echo "=========================================="
-echo ""
-
-read -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
-
+say_header "Настройка Telegram"
+TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram Bot Token (обязательно)")"
 if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
-    error "Telegram Bot Token обязателен!"
-    exit 1
+  error "TELEGRAM_BOT_TOKEN обязателен."
+  exit 1
 fi
+TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"
+TELEGRAM_MANAGER_IDS="$(prompt "ID менеджеров (через запятую)" "")"
 
-read -p "ID администраторов (через запятую): " TELEGRAM_ADMIN_IDS
-read -p "ID менеджеров (через запятую): " TELEGRAM_MANAGER_IDS
-
-read -p "Включить режим группы поддержки (форум-топики)? (y/n) [n]: " ENABLE_GROUP
-ENABLE_GROUP=${ENABLE_GROUP:-n}
+ENABLE_GROUP="$(prompt "Включить режим группы поддержки (форум‑топики)? (y/n)" "n")"
 TELEGRAM_GROUP_MODE="false"
 TELEGRAM_SUPPORT_GROUP_ID=""
 if [ "$ENABLE_GROUP" = "y" ] || [ "$ENABLE_GROUP" = "Y" ]; then
-    TELEGRAM_GROUP_MODE="true"
-    read -p "ID Telegram группы (с форумом): " TELEGRAM_SUPPORT_GROUP_ID
+  TELEGRAM_GROUP_MODE="true"
+  TELEGRAM_SUPPORT_GROUP_ID="$(prompt "ID Telegram группы (с форумом)" "")"
 fi
 
-echo ""
-echo "=========================================="
-echo "Настройка базы данных проектов"
-echo "=========================================="
-echo ""
-
-read -p "Добавить базу данных проекта? (y/n) [n]: " ADD_PROJECT_DB
-ADD_PROJECT_DB=${ADD_PROJECT_DB:-n}
-
-PROJECT_DB_1=""
-PROJECT_DB_2=""
-PROJECT_DB_3=""
-
-if [ "$ADD_PROJECT_DB" = "y" ] || [ "$ADD_PROJECT_DB" = "Y" ]; then
-    echo "Формат: postgresql://user:password@host:port/dbname"
-    echo "Или: sqlite:///path/to/database.db"
-    read -p "База данных проекта 1: " PROJECT_DB_1
-    read -p "База данных проекта 2 (опционально): " PROJECT_DB_2
-    read -p "База данных проекта 3 (опционально): " PROJECT_DB_3
-fi
-
-echo ""
-echo "=========================================="
-echo "Генерация секретных ключей"
-echo "=========================================="
-echo ""
-
-# Генерация JWT секрета
-if command -v python3 &> /dev/null; then
-    JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-    info "JWT секрет сгенерирован"
-else
-    warn "Python3 не найден, используйте случайную строку для JWT_SECRET_KEY"
-    read -p "Введите JWT Secret Key (минимум 32 символа): " JWT_SECRET
-fi
-
-# Генерация пароля для PostgreSQL
-POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-POSTGRES_USER="stels_support"
-POSTGRES_DB="stels_support"
-
-# Обновление .env файла
-info "Обновление файла .env..."
-
-sed -i "s|^PROJECT_NAME=.*|PROJECT_NAME=$PROJECT_NAME|" .env
-sed -i "s|^PROJECT_DESCRIPTION=.*|PROJECT_DESCRIPTION=$PROJECT_DESCRIPTION|" .env
-sed -i "s|^PROJECT_WEBSITE=.*|PROJECT_WEBSITE=$PROJECT_WEBSITE|" .env
-sed -i "s|^PROJECT_BOT_LINK=.*|PROJECT_BOT_LINK=$PROJECT_BOT_LINK|" .env
-sed -i "s|^PROJECT_OWNER_CONTACTS=.*|PROJECT_OWNER_CONTACTS=$PROJECT_OWNER_CONTACTS|" .env
-
+say_header "Настройка AI"
+AI_ENABLED="$(prompt "Включить AI поддержку? (y/n)" "y")"
+AI_SUPPORT_ENABLED="false"
+AI_SUPPORT_API_TYPE="groq"
+AI_SUPPORT_API_KEY=""
 if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
-    sed -i "s|^AI_SUPPORT_ENABLED=.*|AI_SUPPORT_ENABLED=true|" .env
-else
-    sed -i "s|^AI_SUPPORT_ENABLED=.*|AI_SUPPORT_ENABLED=false|" .env
+  AI_SUPPORT_ENABLED="true"
+  AI_TYPE_CHOICE="$(prompt "Тип AI API: 1) Groq  2) Rule-based" "1")"
+  if [ "$AI_TYPE_CHOICE" = "2" ]; then
+    AI_SUPPORT_API_TYPE="rule-based"
+    AI_SUPPORT_API_KEY=""
+  else
+    AI_SUPPORT_API_TYPE="groq"
+    AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"
+  fi
 fi
 
-sed -i "s|^AI_SUPPORT_API_TYPE=.*|AI_SUPPORT_API_TYPE=$AI_TYPE|" .env
-sed -i "s|^AI_SUPPORT_API_KEY=.*|AI_SUPPORT_API_KEY=$AI_API_KEY|" .env
+JWT_SECRET_KEY="$(generate_secret)"
+POSTGRES_USER="delta_support"
+POSTGRES_DB="delta_support"
+POSTGRES_PASSWORD="$(generate_secret | tr -d '=+/' | cut -c1-25)"
+DATABASE_URL_CONTAINER="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
 
-sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN|" .env
-sed -i "s|^TELEGRAM_ADMIN_IDS=.*|TELEGRAM_ADMIN_IDS=$TELEGRAM_ADMIN_IDS|" .env
-sed -i "s|^TELEGRAM_MANAGER_IDS=.*|TELEGRAM_MANAGER_IDS=$TELEGRAM_MANAGER_IDS|" .env
+export PROJECT_NAME PROJECT_DESCRIPTION PROJECT_WEBSITE PROJECT_BOT_LINK PROJECT_OWNER_CONTACTS
+export AI_SUPPORT_ENABLED AI_SUPPORT_API_TYPE AI_SUPPORT_API_KEY
+export TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_IDS TELEGRAM_MANAGER_IDS TELEGRAM_GROUP_MODE TELEGRAM_SUPPORT_GROUP_ID
+export PROJECT_DB_1 PROJECT_DB_2 PROJECT_DB_3
+export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB JWT_SECRET_KEY WEB_PORT DATABASE_URL_CONTAINER
 
-if grep -q "^TELEGRAM_GROUP_MODE=" .env; then
-    sed -i "s|^TELEGRAM_GROUP_MODE=.*|TELEGRAM_GROUP_MODE=$TELEGRAM_GROUP_MODE|" .env
-else
-    echo "TELEGRAM_GROUP_MODE=$TELEGRAM_GROUP_MODE" >> .env
+python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(".env")
+text = path.read_text(encoding="utf-8")
+
+keys = [
+  "PROJECT_NAME",
+  "PROJECT_DESCRIPTION",
+  "PROJECT_WEBSITE",
+  "PROJECT_BOT_LINK",
+  "PROJECT_OWNER_CONTACTS",
+  "AI_SUPPORT_ENABLED",
+  "AI_SUPPORT_API_TYPE",
+  "AI_SUPPORT_API_KEY",
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_ADMIN_IDS",
+  "TELEGRAM_MANAGER_IDS",
+  "TELEGRAM_GROUP_MODE",
+  "TELEGRAM_SUPPORT_GROUP_ID",
+  "PROJECT_DB_1",
+  "PROJECT_DB_2",
+  "PROJECT_DB_3",
+  "POSTGRES_USER",
+  "POSTGRES_PASSWORD",
+  "POSTGRES_DB",
+  "JWT_SECRET_KEY",
+  "WEB_PORT",
+  "DATABASE_URL_CONTAINER",
+]
+
+def dotenv_quote(value: str) -> str:
+  if value is None:
+    return ""
+  s = str(value)
+  if s == "":
+    return ""
+  needs_quotes = any(ch.isspace() for ch in s) or any(ch in s for ch in ['"', '#'])
+  if not needs_quotes:
+    return s
+  s = s.replace("\\", "\\\\").replace('"', '\\"')
+  return f"\"{s}\""
+
+def set_kv(src: str, key: str, value: str) -> str:
+  pattern = re.compile(rf"^(\\s*{re.escape(key)}\\s*=).*?$", re.M)
+  if value is None:
+    value = ""
+  if pattern.search(src):
+    return pattern.sub(rf"\\1{value}", src)
+  if not src.endswith("\\n"):
+    src += "\\n"
+  return src + f"{key}={value}\\n"
+
+for k in keys:
+  v = os.environ.get(k, "")
+  text = set_kv(text, k, dotenv_quote(v))
+
+path.write_text(text, encoding="utf-8")
+PY
+
+mkdir -p data logs web/static/uploads/branding
+
+say_header "Сборка и запуск контейнеров"
+$COMPOSE down 2>/dev/null || true
+$COMPOSE up -d --build
+
+info "Ожидаю готовности сервиса..."
+for i in $(seq 1 60); do
+  if curl -fsS "http://localhost:${WEB_PORT}/api/branding" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+say_header "Статус"
+$COMPOSE ps || true
+
+PUBLIC_IP=""
+if need_cmd curl; then
+  PUBLIC_IP="$(curl -fsSL https://api.ipify.org || true)"
 fi
-if [ -n "$TELEGRAM_SUPPORT_GROUP_ID" ]; then
-    if grep -q "^TELEGRAM_SUPPORT_GROUP_ID=" .env; then
-        sed -i "s|^TELEGRAM_SUPPORT_GROUP_ID=.*|TELEGRAM_SUPPORT_GROUP_ID=$TELEGRAM_SUPPORT_GROUP_ID|" .env
-    else
-        echo "TELEGRAM_SUPPORT_GROUP_ID=$TELEGRAM_SUPPORT_GROUP_ID" >> .env
-    fi
+if [ -z "$PUBLIC_IP" ]; then
+  PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 fi
-
-sed -i "s|^POSTGRES_USER=.*|POSTGRES_USER=$POSTGRES_USER|" .env
-sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" .env
-sed -i "s|^POSTGRES_DB=.*|POSTGRES_DB=$POSTGRES_DB|" .env
-sed -i "s|postgresql://.*@postgres:5432/stels_support|postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB|" .env
-
-sed -i "s|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=$JWT_SECRET|" .env
-
-if [ -n "$PROJECT_DB_1" ]; then
-    sed -i "s|^PROJECT_DB_1=.*|PROJECT_DB_1=$PROJECT_DB_1|" .env
+if [ -z "$PUBLIC_IP" ]; then
+  PUBLIC_IP="SERVER_IP"
 fi
-if [ -n "$PROJECT_DB_2" ]; then
-    sed -i "s|^PROJECT_DB_2=.*|PROJECT_DB_2=$PROJECT_DB_2|" .env
-fi
-if [ -n "$PROJECT_DB_3" ]; then
-    sed -i "s|^PROJECT_DB_3=.*|PROJECT_DB_3=$PROJECT_DB_3|" .env
-fi
-
-info "Файл .env обновлен"
 
 echo ""
-echo "=========================================="
-echo "Сборка и запуск Docker контейнеров"
-echo "=========================================="
+info "Веб-интерфейс: http://${PUBLIC_IP}:${WEB_PORT}/"
+info "Логин/пароль по умолчанию: admin / admin123"
+warn "Сразу после входа поменяйте пароль пользователя admin."
 echo ""
-
-# Создание директорий
-mkdir -p data logs
-chmod 755 data logs
-
-info "Создание необходимых директорий..."
-
-# Сборка и запуск
-info "Запуск Docker Compose..."
-
-$DOCKER_COMPOSE_CMD down 2>/dev/null || true
-$DOCKER_COMPOSE_CMD build
-$DOCKER_COMPOSE_CMD up -d
-
-info "Ожидание запуска сервисов..."
-sleep 10
-
-# Проверка статуса
-if $DOCKER_COMPOSE_CMD ps | grep -q "Up"; then
-    info "✅ Сервисы успешно запущены!"
-    echo ""
-    echo "=========================================="
-    echo "Установка завершена!"
-    echo "=========================================="
-    echo ""
-    echo "Проверьте статус: $DOCKER_COMPOSE_CMD ps"
-    echo "Просмотр логов: $DOCKER_COMPOSE_CMD logs -f"
-    echo ""
-    info "Бот готов к работе!"
-else
-    error "Ошибка при запуске сервисов. Проверьте логи: $DOCKER_COMPOSE_CMD logs"
-    exit 1
-fi

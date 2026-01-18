@@ -1,28 +1,30 @@
+FROM node:20-alpine AS frontend_builder
+WORKDIR /build
+COPY web/frontend/package.json web/frontend/package-lock.json web/frontend/
+RUN cd web/frontend && npm ci
+COPY web/frontend web/frontend
+RUN npm --prefix web/frontend run build
+
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
+    bash \
     gcc \
-    postgresql-client \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование кода приложения
 COPY . .
+COPY --from=frontend_builder /build/web/static/spa /app/web/static/spa
 
-# Создание директорий для данных и логов
-RUN mkdir -p /app/data /app/logs
-
-# Установка прав
+RUN mkdir -p /app/data /app/logs /app/web/static/uploads/branding
 RUN chmod +x /app/scripts/*.sh 2>/dev/null || true
+RUN chmod +x /app/scripts/entrypoint.sh
 
-# Порт приложения
 EXPOSE 8080
 
-# Команда запуска
-CMD ["python", "main.py"]
+CMD ["/app/scripts/entrypoint.sh"]

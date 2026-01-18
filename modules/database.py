@@ -1,201 +1,260 @@
 """
-Модуль работы с базой данных
+Модуль работы с базой данных (Tortoise ORM)
+Поддерживает PostgreSQL и SQLite
 """
 
-import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, Boolean, ForeignKey, JSON, select, update
-from datetime import datetime
-from typing import Optional, List, Dict
-import json
-
+import logging
+from typing import Optional, List
+from tortoise import Tortoise, fields
+from tortoise.models import Model
+from tortoise.expressions import Q
 from modules.config import Config
 
-Base = declarative_base()
+logger = logging.getLogger(__name__)
 
-
-class Chat(Base):
+class Chat(Model):
     """Модель чата"""
-    __tablename__ = "chats"
+    id = fields.IntField(pk=True)
+    user_id = fields.BigIntField(index=True)
+    user_tg_id = fields.BigIntField(index=True, null=True)
+    username = fields.CharField(max_length=255, null=True)
+    first_name = fields.CharField(max_length=255, null=True)
+    last_name = fields.CharField(max_length=255, null=True)
+    status = fields.CharField(max_length=50, default="active")  # active, waiting_manager, closed
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    manager_id = fields.BigIntField(null=True)
+    assigned_admin_id = fields.IntField(null=True)
+    last_message_at = fields.DatetimeField(null=True)
+    topic_id = fields.BigIntField(null=True)
     
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False, index=True)
-    username = Column(String(255))
-    first_name = Column(String(255))
-    last_name = Column(String(255))
-    status = Column(String(50), default="active")  # active, waiting_manager, closed
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    manager_id = Column(BigInteger, nullable=True)  # ID менеджера, подключенного к чату
+    # Reverse relations
+    messages: fields.ReverseRelation["Message"]
+    notifications: fields.ReverseRelation["ManagerNotification"]
 
+    class Meta:
+        table = "chats"
 
-class Message(Base):
+class Message(Model):
     """Модель сообщения"""
-    __tablename__ = "messages"
-    
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False, index=True)
-    user_id = Column(BigInteger, nullable=False)
-    message_type = Column(String(50), default="user")  # user, ai, manager
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    id = fields.IntField(pk=True)
+    chat = fields.ForeignKeyField('models.Chat', related_name='messages', index=True)
+    user_id = fields.BigIntField()
+    message_type = fields.CharField(max_length=50, default="user")  # user, ai, manager
+    content = fields.TextField()
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    # Новые поля по ТЗ
+    source = fields.CharField(max_length=50, null=True)  # user | manager_web | manager_group | ai | system
+    text = fields.TextField(null=True)
+    media_type = fields.CharField(max_length=20, null=True)  # photo | video | document | audio | voice | sticker | none
+    media_file_id = fields.CharField(max_length=255, null=True)
+    tg_message_id_user = fields.BigIntField(null=True)
+    tg_message_id_group = fields.BigIntField(null=True)
+    admin_user_id = fields.IntField(null=True)
+    client_event_id = fields.CharField(max_length=64, null=True)
 
+    class Meta:
+        table = "messages"
 
-class ManagerNotification(Base):
+class ManagerNotification(Model):
     """Модель уведомления менеджера"""
-    __tablename__ = "manager_notifications"
-    
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False, index=True)
-    manager_id = Column(BigInteger, nullable=False, index=True)
-    status = Column(String(50), default="pending")  # pending, viewed, accepted
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id = fields.IntField(pk=True)
+    chat = fields.ForeignKeyField('models.Chat', related_name='notifications', index=True)
+    manager_id = fields.BigIntField(index=True)
+    status = fields.CharField(max_length=50, default="pending")  # pending, viewed, accepted
+    created_at = fields.DatetimeField(auto_now_add=True)
 
+    class Meta:
+        table = "manager_notifications"
 
-class ProjectDatabase(Base):
+class AdminUser(Model):
+    """Модель пользователя админ-панели"""
+    id = fields.IntField(pk=True)
+    username = fields.CharField(max_length=50, unique=True)
+    password_hash = fields.CharField(max_length=255)
+    role = fields.CharField(max_length=20, default="manager")  # admin, manager
+    is_active = fields.BooleanField(default=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    last_login = fields.DatetimeField(null=True)
+    access_start_hour = fields.IntField(null=True)
+    access_end_hour = fields.IntField(null=True)
+
+    class Meta:
+        table = "admin_users"
+
+class SystemConfig(Model):
+    """Модель системных настроек"""
+    key = fields.CharField(max_length=100, pk=True)
+    value = fields.TextField()
+    description = fields.CharField(max_length=255, null=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "system_config"
+
+class ProjectDatabase(Model):
     """Модель подключенных баз данных проектов"""
-    __tablename__ = "project_databases"
-    
-    id = Column(Integer, primary_key=True)
-    name = Column(String(255))
-    connection_string = Column(String(500))
-    db_type = Column(String(50))  # postgresql, sqlite
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id = fields.IntField(pk=True)
+    name = fields.CharField(max_length=255, null=True)
+    connection_string = fields.CharField(max_length=500, null=True)
+    db_type = fields.CharField(max_length=50, null=True)  # postgresql, sqlite
+    created_at = fields.DatetimeField(auto_now_add=True)
 
+    class Meta:
+        table = "project_databases"
+
+class KnowledgeBaseEntry(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=255)
+    content = fields.TextField()
+    is_active = fields.BooleanField(default=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "knowledge_base"
 
 class Database:
-    """Класс для работы с базой данных"""
+    """Класс для работы с базой данных (Wrapper для Tortoise ORM)"""
     
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config()
-        self.engine = None
-        self.session_factory = None
     
     async def initialize(self):
         """Инициализация подключения к базе данных"""
-        # Конвертируем postgresql:// в postgresql+asyncpg:// для async
-        database_url = self.config.database_url
-        if database_url.startswith("postgresql://"):
-            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        db_url = self.config.database_url
         
-        self.engine = create_async_engine(
-            database_url,
-            echo=self.config.debug,
-            pool_pre_ping=True,
-            pool_size=10,
-            max_overflow=20
+        # Корректировка URL для Tortoise
+        # Tortoise использует postgres:// вместо postgresql://
+        if db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgres://")
+        
+        # Для SQLite формат sqlite://path/to/db.sqlite3
+        
+        logger.info(f"Initializing Database with URL type: {db_url.split(':')[0]}")
+        
+        await Tortoise.init(
+            db_url=db_url,
+            modules={'models': ['modules.database']}
         )
         
-        self.session_factory = async_sessionmaker(
-            self.engine,
-            class_=AsyncSession,
-            expire_on_commit=False
-        )
+        # Генерируем схему (создаем таблицы)
+        await Tortoise.generate_schemas()
+        logger.info("Database initialized and schemas generated")
         
-        # Создание таблиц
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    
-    def get_session(self):
-        """Получить сессию базы данных (async context manager)"""
-        return self.session_factory()
+        # Пытаться апгрейдить схему для существующих таблиц (SQLite без мигратора)
+        try:
+            if db_url.startswith("sqlite"):
+                conn = Tortoise.get_connection("default")
+                # Chat доп. колонки
+                for ddl in [
+                    "ALTER TABLE chats ADD COLUMN user_tg_id INTEGER",
+                    "ALTER TABLE chats ADD COLUMN assigned_admin_id INTEGER",
+                    "ALTER TABLE chats ADD COLUMN last_message_at TEXT",
+                    "ALTER TABLE chats ADD COLUMN topic_id INTEGER",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+                # Message доп. колонки
+                for ddl in [
+                    "ALTER TABLE messages ADD COLUMN source TEXT",
+                    "ALTER TABLE messages ADD COLUMN text TEXT",
+                    "ALTER TABLE messages ADD COLUMN media_type TEXT",
+                    "ALTER TABLE messages ADD COLUMN media_file_id TEXT",
+                    "ALTER TABLE messages ADD COLUMN tg_message_id_user INTEGER",
+                    "ALTER TABLE messages ADD COLUMN tg_message_id_group INTEGER",
+                    "ALTER TABLE messages ADD COLUMN admin_user_id INTEGER",
+                    "ALTER TABLE messages ADD COLUMN client_event_id TEXT",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+                for ddl in [
+                    "ALTER TABLE admin_users ADD COLUMN access_start_hour INTEGER",
+                    "ALTER TABLE admin_users ADD COLUMN access_end_hour INTEGER",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     
     async def create_chat(self, user_id: int, username: str = None, 
                          first_name: str = None, last_name: str = None) -> Chat:
         """Создать новый чат"""
-        async with self.get_session() as session:
-            chat = Chat(
-                user_id=user_id,
-                username=username,
-                first_name=first_name,
-                last_name=last_name,
-                status="active"
-            )
-            session.add(chat)
-            await session.commit()
-            await session.refresh(chat)
-            return chat
+        chat = await Chat.create(
+            user_id=user_id,
+            user_tg_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            status="active"
+        )
+        return chat
     
     async def get_chat_by_user_id(self, user_id: int) -> Optional[Chat]:
         """Получить активный чат пользователя"""
-        async with self.get_session() as session:
-            result = await session.execute(
-                select(Chat).where(
-                    Chat.user_id == user_id,
-                    Chat.status.in_(["active", "waiting_manager"])
-                ).order_by(Chat.created_at.desc())
-            )
-            return result.scalar_one_or_none()
+        return await Chat.filter(
+            user_id=user_id,
+            status__in=["active", "waiting_manager"]
+        ).order_by("-created_at").first()
     
     async def get_chat_by_id(self, chat_id: int) -> Optional[Chat]:
         """Получить чат по ID"""
-        async with self.get_session() as session:
-            result = await session.execute(
-                select(Chat).where(Chat.id == chat_id)
-            )
-            return result.scalar_one_or_none()
+        return await Chat.get_or_none(id=chat_id)
     
     async def add_message(self, chat_id: int, user_id: int, 
                          content: str, message_type: str = "user") -> Message:
         """Добавить сообщение в чат"""
-        async with self.get_session() as session:
-            message = Message(
-                chat_id=chat_id,
-                user_id=user_id,
-                message_type=message_type,
-                content=content
-            )
-            session.add(message)
-            await session.commit()
-            await session.refresh(message)
-            return message
+        # Маппинг старой схемы в новую
+        source = {
+            "user": "user",
+            "ai": "ai",
+            "manager": "manager_web"
+        }.get(message_type, "system")
+        message = await Message.create(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_type=message_type,
+            content=content,
+            source=source,
+            text=content
+        )
+        # Обновляем last_message_at
+        await Chat.filter(id=chat_id).update(last_message_at=message.created_at)
+        return message
     
     async def get_chat_messages(self, chat_id: int, limit: int = 50) -> List[Message]:
         """Получить сообщения чата"""
-        async with self.get_session() as session:
-            result = await session.execute(
-                select(Message)
-                .where(Message.chat_id == chat_id)
-                .order_by(Message.created_at.asc())
-                .limit(limit)
-            )
-            return list(result.scalars().all())
+        return await Message.filter(chat_id=chat_id).order_by("created_at").limit(limit).all()
     
     async def update_chat_status(self, chat_id: int, status: str, manager_id: int = None):
         """Обновить статус чата"""
-        async with self.get_session() as session:
-            await session.execute(
-                update(Chat)
-                .where(Chat.id == chat_id)
-                .values(status=status, manager_id=manager_id, updated_at=datetime.utcnow())
-            )
-            await session.commit()
+        update_data = {"status": status}
+        if manager_id is not None:
+            update_data["manager_id"] = manager_id
+        
+        await Chat.filter(id=chat_id).update(**update_data)
     
     async def create_manager_notification(self, chat_id: int, manager_id: int) -> ManagerNotification:
         """Создать уведомление для менеджера"""
-        async with self.get_session() as session:
-            notification = ManagerNotification(
-                chat_id=chat_id,
-                manager_id=manager_id,
-                status="pending"
-            )
-            session.add(notification)
-            await session.commit()
-            await session.refresh(notification)
-            return notification
+        return await ManagerNotification.create(
+            chat_id=chat_id,
+            manager_id=manager_id,
+            status="pending"
+        )
     
     async def get_all_chats(self, status: str = None) -> List[Chat]:
         """Получить все чаты (для админов/менеджеров)"""
-        async with self.get_session() as session:
-            query = select(Chat)
-            if status:
-                query = query.where(Chat.status == status)
-            query = query.order_by(Chat.updated_at.desc())
-            result = await session.execute(query)
-            return list(result.scalars().all())
+        query = Chat.all().order_by("-updated_at")
+        if status:
+            query = query.filter(status=status)
+        return await query
     
     async def close(self):
         """Закрыть подключение к базе данных"""
-        if self.engine:
-            await self.engine.dispose()
+        await Tortoise.close_connections()
