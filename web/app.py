@@ -29,8 +29,6 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 # Подключение статики
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 SPA_DIR = STATIC_DIR / "spa"
-if SPA_DIR.exists():
-    app.mount("/app", StaticFiles(directory=str(SPA_DIR), html=True), name="app")
 
 # Настройка шаблонов
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -48,9 +46,12 @@ app.include_router(api_settings.router)
 app.include_router(api_branding.router)
 app.include_router(api_kb.router)
 
-@app.get("/")
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "title": "DELTA-Support"})
+if SPA_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(SPA_DIR), html=True), name="spa")
+else:
+    @app.get("/")
+    async def index(request: Request):
+        return templates.TemplateResponse("index.html", {"request": request, "title": "DELTA-Support"})
 
 # WS manager в состоянии приложения
 app.state.ws_manager = WSManager()

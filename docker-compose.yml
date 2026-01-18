@@ -58,15 +58,15 @@ services:
       dockerfile: Dockerfile
     container_name: delta-support-app
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=${DATABASE_URL_CONTAINER:-postgresql://${POSTGRES_USER:-delta_support}:${POSTGRES_PASSWORD:-delta_support_password}@postgres:5432/${POSTGRES_DB:-delta_support}}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - AI_SUPPORT_ENABLED=${AI_SUPPORT_ENABLED}
-      - AI_SUPPORT_API_TYPE=${AI_SUPPORT_API_TYPE}
-      - AI_SUPPORT_API_KEY=${AI_SUPPORT_API_KEY}
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
+      - AI_SUPPORT_ENABLED=${AI_SUPPORT_ENABLED:-true}
+      - AI_SUPPORT_API_TYPE=${AI_SUPPORT_API_TYPE:-groq}
+      - AI_SUPPORT_API_KEY=${AI_SUPPORT_API_KEY:-}
+      - REDIS_HOST=${REDIS_HOST_CONTAINER:-redis}
+      - REDIS_PORT=${REDIS_PORT_CONTAINER:-6379}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - APP_PORT=${APP_PORT:-8080}
+      - APP_PORT=8080
       - DEBUG=${DEBUG:-false}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
@@ -82,8 +82,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./web/static/uploads/branding:/app/web/static/uploads/branding
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${WEB_PORT:-3030}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +93,11 @@ services:
     networks:
       - delta-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/branding >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres_data:
