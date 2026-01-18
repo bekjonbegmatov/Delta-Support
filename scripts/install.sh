@@ -133,8 +133,7 @@ prompt_secret() {
   local msg="$1"
   local var
   require_tty_or_env
-  read -r -s -p "$msg: " var <"$TTY_IN"
-  echo ""
+  read -r -p "$msg: " var <"$TTY_IN"
   echo "$var"
 }
 
@@ -253,79 +252,66 @@ if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
   fi
 fi
 
+sanitize_one_line() {
+  local v="${1:-}"
+  v="${v//$'\r'/}"
+  v="${v//$'\n'/}"
+  echo "$v"
+}
+
+set_dotenv() {
+  local key="$1"
+  local value
+  value="$(sanitize_one_line "${2:-}")"
+  if [ -f .env ] && grep -q "^${key}=" .env; then
+    local escaped
+    escaped="$(printf '%s' "$value" | sed -e 's/[\\&/]/\\&/g')"
+    sed -i "s/^${key}=.*/${key}=${escaped}/" .env
+  else
+    echo "${key}=${value}" >> .env
+  fi
+}
+
+PROJECT_NAME="$(sanitize_one_line "$PROJECT_NAME")"
+PROJECT_DESCRIPTION="$(sanitize_one_line "$PROJECT_DESCRIPTION")"
+PROJECT_WEBSITE="$(sanitize_one_line "$PROJECT_WEBSITE")"
+PROJECT_BOT_LINK="$(sanitize_one_line "$PROJECT_BOT_LINK")"
+PROJECT_OWNER_CONTACTS="$(sanitize_one_line "$PROJECT_OWNER_CONTACTS")"
+TELEGRAM_BOT_TOKEN="$(sanitize_one_line "$TELEGRAM_BOT_TOKEN")"
+TELEGRAM_ADMIN_IDS="$(sanitize_one_line "$TELEGRAM_ADMIN_IDS")"
+TELEGRAM_MANAGER_IDS="$(sanitize_one_line "$TELEGRAM_MANAGER_IDS")"
+TELEGRAM_GROUP_MODE="$(sanitize_one_line "$TELEGRAM_GROUP_MODE")"
+TELEGRAM_SUPPORT_GROUP_ID="$(sanitize_one_line "$TELEGRAM_SUPPORT_GROUP_ID")"
+AI_SUPPORT_ENABLED="$(sanitize_one_line "$AI_SUPPORT_ENABLED")"
+AI_SUPPORT_API_TYPE="$(sanitize_one_line "$AI_SUPPORT_API_TYPE")"
+AI_SUPPORT_API_KEY="$(sanitize_one_line "$AI_SUPPORT_API_KEY")"
+WEB_PORT="$(sanitize_one_line "$WEB_PORT")"
+
 JWT_SECRET_KEY="$(generate_secret)"
 POSTGRES_USER="delta_support"
 POSTGRES_DB="delta_support"
 POSTGRES_PASSWORD="$(generate_secret | tr -d '=+/' | cut -c1-25)"
 DATABASE_URL_CONTAINER="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
 
-export PROJECT_NAME PROJECT_DESCRIPTION PROJECT_WEBSITE PROJECT_BOT_LINK PROJECT_OWNER_CONTACTS
-export AI_SUPPORT_ENABLED AI_SUPPORT_API_TYPE AI_SUPPORT_API_KEY
-export TELEGRAM_BOT_TOKEN TELEGRAM_ADMIN_IDS TELEGRAM_MANAGER_IDS TELEGRAM_GROUP_MODE TELEGRAM_SUPPORT_GROUP_ID
-export PROJECT_DB_1 PROJECT_DB_2 PROJECT_DB_3
-export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB JWT_SECRET_KEY WEB_PORT DATABASE_URL_CONTAINER
-
-python3 - <<'PY'
-import os
-import re
-from pathlib import Path
-
-path = Path(".env")
-text = path.read_text(encoding="utf-8")
-
-keys = [
-  "PROJECT_NAME",
-  "PROJECT_DESCRIPTION",
-  "PROJECT_WEBSITE",
-  "PROJECT_BOT_LINK",
-  "PROJECT_OWNER_CONTACTS",
-  "AI_SUPPORT_ENABLED",
-  "AI_SUPPORT_API_TYPE",
-  "AI_SUPPORT_API_KEY",
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_ADMIN_IDS",
-  "TELEGRAM_MANAGER_IDS",
-  "TELEGRAM_GROUP_MODE",
-  "TELEGRAM_SUPPORT_GROUP_ID",
-  "PROJECT_DB_1",
-  "PROJECT_DB_2",
-  "PROJECT_DB_3",
-  "POSTGRES_USER",
-  "POSTGRES_PASSWORD",
-  "POSTGRES_DB",
-  "JWT_SECRET_KEY",
-  "WEB_PORT",
-  "DATABASE_URL_CONTAINER",
-]
-
-def dotenv_quote(value: str) -> str:
-  if value is None:
-    return ""
-  s = str(value)
-  if s == "":
-    return ""
-  needs_quotes = any(ch.isspace() for ch in s) or any(ch in s for ch in ['"', '#'])
-  if not needs_quotes:
-    return s
-  s = s.replace("\\", "\\\\").replace('"', '\\"')
-  return f"\"{s}\""
-
-def set_kv(src: str, key: str, value: str) -> str:
-  pattern = re.compile(rf"^(\\s*{re.escape(key)}\\s*=).*?$", re.M)
-  if value is None:
-    value = ""
-  if pattern.search(src):
-    return pattern.sub(rf"\\1{value}", src)
-  if not src.endswith("\\n"):
-    src += "\\n"
-  return src + f"{key}={value}\\n"
-
-for k in keys:
-  v = os.environ.get(k, "")
-  text = set_kv(text, k, dotenv_quote(v))
-
-path.write_text(text, encoding="utf-8")
-PY
+set_dotenv PROJECT_NAME "$PROJECT_NAME"
+set_dotenv PROJECT_DESCRIPTION "$PROJECT_DESCRIPTION"
+set_dotenv PROJECT_WEBSITE "$PROJECT_WEBSITE"
+set_dotenv PROJECT_BOT_LINK "$PROJECT_BOT_LINK"
+set_dotenv PROJECT_OWNER_CONTACTS "$PROJECT_OWNER_CONTACTS"
+set_dotenv WEB_PORT "$WEB_PORT"
+set_dotenv TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+set_dotenv TELEGRAM_ADMIN_IDS "$TELEGRAM_ADMIN_IDS"
+set_dotenv TELEGRAM_MANAGER_IDS "$TELEGRAM_MANAGER_IDS"
+set_dotenv TELEGRAM_GROUP_MODE "$TELEGRAM_GROUP_MODE"
+set_dotenv TELEGRAM_SUPPORT_GROUP_ID "$TELEGRAM_SUPPORT_GROUP_ID"
+set_dotenv AI_SUPPORT_ENABLED "$AI_SUPPORT_ENABLED"
+set_dotenv AI_SUPPORT_API_TYPE "$AI_SUPPORT_API_TYPE"
+set_dotenv AI_SUPPORT_API_KEY "$AI_SUPPORT_API_KEY"
+set_dotenv POSTGRES_USER "$POSTGRES_USER"
+set_dotenv POSTGRES_PASSWORD "$POSTGRES_PASSWORD"
+set_dotenv POSTGRES_DB "$POSTGRES_DB"
+set_dotenv JWT_SECRET_KEY "$JWT_SECRET_KEY"
+set_dotenv DATABASE_URL_CONTAINER "$DATABASE_URL_CONTAINER"
 
 mkdir -p data logs web/static/uploads/branding
 
