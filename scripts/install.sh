@@ -100,15 +100,31 @@ compose_cmd() {
   echo "$D compose"
 }
 
+TTY_IN=""
+if [ -t 0 ]; then
+  TTY_IN="/dev/stdin"
+elif [ -r /dev/tty ]; then
+  TTY_IN="/dev/tty"
+fi
+
+require_tty_or_env() {
+  if [ -n "$TTY_IN" ]; then
+    return
+  fi
+  error "Нет TTY для ввода. Запусти в интерактивной сессии или передай переменные окружения (TELEGRAM_BOT_TOKEN и т.д.)."
+  exit 1
+}
+
 prompt() {
   local msg="$1"
   local def="${2:-}"
   local var
+  require_tty_or_env
   if [ -n "$def" ]; then
-    read -r -p "$msg [$def]: " var
+    read -r -p "$msg [$def]: " var <"$TTY_IN"
     echo "${var:-$def}"
   else
-    read -r -p "$msg: " var
+    read -r -p "$msg: " var <"$TTY_IN"
     echo "$var"
   fi
 }
@@ -116,7 +132,8 @@ prompt() {
 prompt_secret() {
   local msg="$1"
   local var
-  read -r -s -p "$msg: " var
+  require_tty_or_env
+  read -r -s -p "$msg: " var <"$TTY_IN"
   echo ""
   echo "$var"
 }
@@ -181,45 +198,58 @@ if [ -f .env ]; then
 fi
 cp env.example .env
 
-PROJECT_NAME="$(prompt "Название проекта" "DELTA-Support")"
-PROJECT_DESCRIPTION="$(prompt "Описание проекта" "")"
-PROJECT_WEBSITE="$(prompt "Сайт проекта (если есть)" "")"
-PROJECT_BOT_LINK="$(prompt "Ссылка на бота (если есть)" "")"
-PROJECT_OWNER_CONTACTS="$(prompt "Контакты владельца" "")"
+PROJECT_NAME="${PROJECT_NAME:-}"
+PROJECT_DESCRIPTION="${PROJECT_DESCRIPTION:-}"
+PROJECT_WEBSITE="${PROJECT_WEBSITE:-}"
+PROJECT_BOT_LINK="${PROJECT_BOT_LINK:-}"
+PROJECT_OWNER_CONTACTS="${PROJECT_OWNER_CONTACTS:-}"
+if [ -z "$PROJECT_NAME" ]; then PROJECT_NAME="$(prompt "Название проекта" "DELTA-Support")"; fi
+if [ -z "$PROJECT_DESCRIPTION" ]; then PROJECT_DESCRIPTION="$(prompt "Описание проекта" "")"; fi
+if [ -z "$PROJECT_WEBSITE" ]; then PROJECT_WEBSITE="$(prompt "Сайт проекта (если есть)" "")"; fi
+if [ -z "$PROJECT_BOT_LINK" ]; then PROJECT_BOT_LINK="$(prompt "Ссылка на бота (если есть)" "")"; fi
+if [ -z "$PROJECT_OWNER_CONTACTS" ]; then PROJECT_OWNER_CONTACTS="$(prompt "Контакты владельца" "")"; fi
 
-WEB_PORT="$(prompt "Порт веб-интерфейса" "3030")"
+WEB_PORT="${WEB_PORT:-}"
+if [ -z "$WEB_PORT" ]; then WEB_PORT="$(prompt "Порт веб-интерфейса" "3030")"; fi
 
 say_header "Настройка Telegram"
-TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram Bot Token (обязательно)")"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram Bot Token (обязательно)")"; fi
 if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
   error "TELEGRAM_BOT_TOKEN обязателен."
   exit 1
 fi
-TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"
-TELEGRAM_MANAGER_IDS="$(prompt "ID менеджеров (через запятую)" "")"
+TELEGRAM_ADMIN_IDS="${TELEGRAM_ADMIN_IDS:-}"
+TELEGRAM_MANAGER_IDS="${TELEGRAM_MANAGER_IDS:-}"
+if [ -z "$TELEGRAM_ADMIN_IDS" ]; then TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"; fi
+if [ -z "$TELEGRAM_MANAGER_IDS" ]; then TELEGRAM_MANAGER_IDS="$(prompt "ID менеджеров (через запятую)" "")"; fi
 
-ENABLE_GROUP="$(prompt "Включить режим группы поддержки (форум‑топики)? (y/n)" "n")"
+ENABLE_GROUP="${ENABLE_GROUP:-}"
+if [ -z "$ENABLE_GROUP" ]; then ENABLE_GROUP="$(prompt "Включить режим группы поддержки (форум‑топики)? (y/n)" "n")"; fi
 TELEGRAM_GROUP_MODE="false"
 TELEGRAM_SUPPORT_GROUP_ID=""
 if [ "$ENABLE_GROUP" = "y" ] || [ "$ENABLE_GROUP" = "Y" ]; then
   TELEGRAM_GROUP_MODE="true"
-  TELEGRAM_SUPPORT_GROUP_ID="$(prompt "ID Telegram группы (с форумом)" "")"
+  TELEGRAM_SUPPORT_GROUP_ID="${TELEGRAM_SUPPORT_GROUP_ID:-}"
+  if [ -z "$TELEGRAM_SUPPORT_GROUP_ID" ]; then TELEGRAM_SUPPORT_GROUP_ID="$(prompt "ID Telegram группы (с форумом)" "")"; fi
 fi
 
 say_header "Настройка AI"
-AI_ENABLED="$(prompt "Включить AI поддержку? (y/n)" "y")"
+AI_ENABLED="${AI_ENABLED:-}"
+if [ -z "$AI_ENABLED" ]; then AI_ENABLED="$(prompt "Включить AI поддержку? (y/n)" "y")"; fi
 AI_SUPPORT_ENABLED="false"
 AI_SUPPORT_API_TYPE="groq"
-AI_SUPPORT_API_KEY=""
+AI_SUPPORT_API_KEY="${AI_SUPPORT_API_KEY:-}"
 if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
   AI_SUPPORT_ENABLED="true"
-  AI_TYPE_CHOICE="$(prompt "Тип AI API: 1) Groq  2) Rule-based" "1")"
+  AI_TYPE_CHOICE="${AI_TYPE_CHOICE:-}"
+  if [ -z "$AI_TYPE_CHOICE" ]; then AI_TYPE_CHOICE="$(prompt "Тип AI API: 1) Groq  2) Rule-based" "1")"; fi
   if [ "$AI_TYPE_CHOICE" = "2" ]; then
     AI_SUPPORT_API_TYPE="rule-based"
     AI_SUPPORT_API_KEY=""
   else
     AI_SUPPORT_API_TYPE="groq"
-    AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"
+    if [ -z "$AI_SUPPORT_API_KEY" ]; then AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"; fi
   fi
 fi
 
