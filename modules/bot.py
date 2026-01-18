@@ -6,6 +6,7 @@ import asyncio
 import json
 import redis
 import html
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -21,7 +22,7 @@ from loguru import logger
 from typing import Optional
 
 from modules.config import Config
-from modules.database import Database
+from modules.database import Database, SystemConfig
 from modules.ai_support import AISupport
 
 
@@ -34,12 +35,97 @@ class SupportBot:
         self.ai = AISupport(config)
         self.application = None
         self.redis = None
+        self.ws_manager = None
         self._group_id = None
+        self._group_mode_enabled = bool(config.telegram_group_mode)
+        self._topic_title_template = "{emoji} {first_name} ({user_id}) {status_label}"
+        self._emoji_by_role = {"default": "🟢", "client": "🔴", "manager": "🟡", "ai": "🤖"}
+        self._emoji_by_status = {"active": "🟢", "waiting_manager": "🟡", "closed": "🔴"}
+        self._project_name = config.project_name or "DELTA-Support"
+        self._project_description = config.project_description or ""
+        self._project_website = config.project_website or ""
+        self._project_bot_link = config.project_bot_link or ""
+        self._project_owner_contacts = config.project_owner_contacts or ""
+        self._welcome_template = (
+            "👋 Здравствуйте, {first_name}!\n\n"
+            "Я бот поддержки проекта {project_name}.\n"
+            "Я помогу вам с вопросами и проблемами.\n\n"
+            "Просто напишите ваш вопрос, и я постараюсь помочь!\n\n"
+            "{project_description}"
+        )
+        self._runtime_settings_ts = 0.0
         try:
             from chatgpt_md_converter import telegram_format as _md_to_html
             self._md_to_html = _md_to_html
         except Exception:
             self._md_to_html = lambda t: html.escape(t or "")
+
+    async def refresh_runtime_settings(self, force: bool = False):
+        now = time.monotonic()
+        if not force and now - self._runtime_settings_ts < 3.0:
+            return
+        keys = [
+            "telegram_group_mode",
+            "telegram_support_group_id",
+            "telegram_topic_title_template",
+            "telegram_emoji_default",
+            "telegram_emoji_client",
+            "telegram_emoji_manager",
+            "telegram_emoji_ai",
+            "telegram_status_emoji_active",
+            "telegram_status_emoji_waiting_manager",
+            "telegram_status_emoji_closed",
+            "project_name",
+            "project_description",
+            "project_website",
+            "project_bot_link",
+            "project_owner_contacts",
+            "bot_welcome_message",
+        ]
+        rows = await SystemConfig.filter(key__in=keys).all()
+        values = {r.key: (r.value or "") for r in rows}
+
+        if "telegram_group_mode" in values:
+            self._group_mode_enabled = str(values.get("telegram_group_mode") or "").lower() in ["1", "true", "yes", "y", "on"]
+        else:
+            self._group_mode_enabled = bool(self.config.telegram_group_mode)
+
+        if "telegram_support_group_id" in values:
+            group_id_raw = (values.get("telegram_support_group_id") or "").strip()
+            if group_id_raw and group_id_raw.lstrip("-").isdigit():
+                self._group_id = int(group_id_raw)
+            else:
+                self._group_id = None
+        else:
+            self._group_id = self.config.telegram_support_group_id if self._group_mode_enabled else None
+
+        tpl = (values.get("telegram_topic_title_template") or "").strip()
+        if tpl:
+            self._topic_title_template = tpl
+
+        self._emoji_by_role["default"] = (values.get("telegram_emoji_default") or self._emoji_by_role["default"]).strip() or self._emoji_by_role["default"]
+        self._emoji_by_role["client"] = (values.get("telegram_emoji_client") or self._emoji_by_role["client"]).strip() or self._emoji_by_role["client"]
+        self._emoji_by_role["manager"] = (values.get("telegram_emoji_manager") or self._emoji_by_role["manager"]).strip() or self._emoji_by_role["manager"]
+        self._emoji_by_role["ai"] = (values.get("telegram_emoji_ai") or self._emoji_by_role["ai"]).strip() or self._emoji_by_role["ai"]
+
+        self._emoji_by_status["active"] = (values.get("telegram_status_emoji_active") or self._emoji_by_status["active"]).strip() or self._emoji_by_status["active"]
+        self._emoji_by_status["waiting_manager"] = (values.get("telegram_status_emoji_waiting_manager") or self._emoji_by_status["waiting_manager"]).strip() or self._emoji_by_status["waiting_manager"]
+        self._emoji_by_status["closed"] = (values.get("telegram_status_emoji_closed") or self._emoji_by_status["closed"]).strip() or self._emoji_by_status["closed"]
+
+        self._project_name = (values.get("project_name") or self.config.project_name or self._project_name).strip() or self._project_name
+        self._project_description = (values.get("project_description") or self.config.project_description or "").strip()
+        self._project_website = (values.get("project_website") or self.config.project_website or "").strip()
+        self._project_bot_link = (values.get("project_bot_link") or self.config.project_bot_link or "").strip()
+        self._project_owner_contacts = (values.get("project_owner_contacts") or self.config.project_owner_contacts or "").strip()
+
+        welcome = values.get("bot_welcome_message")
+        if welcome and welcome.strip():
+            self._welcome_template = welcome
+
+        if not self._group_mode_enabled:
+            self._group_id = None
+
+        self._runtime_settings_ts = now
     
     async def initialize(self):
         """Инициализация бота"""
@@ -79,14 +165,27 @@ class SupportBot:
         
         logger.info("Bot handlers registered")
     
-    async def start(self):
-        """Запуск бота"""
-        logger.info("Bot started polling")
-        
-        # Инициализируем и запускаем polling вручную
+    async def start_polling(self):
+        """Запуск поллинга без блокировки"""
+        logger.info("Bot starting polling...")
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling(drop_pending_updates=True)
+    
+    async def stop(self):
+        """Остановка бота"""
+        logger.info("Stopping bot...")
+        if self.application.updater:
+            await self.application.updater.stop()
+        if self.application:
+            await self.application.stop()
+            await self.application.shutdown()
+
+    async def start(self):
+        """Запуск бота (блокирующий)"""
+        logger.info("Bot started polling")
+        
+        await self.start_polling()
         
         # Держим бота работающим
         try:
@@ -94,10 +193,7 @@ class SupportBot:
             stop_event = asyncio.Event()
             await stop_event.wait()
         except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Stopping bot...")
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+            await self.stop()
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
@@ -134,18 +230,30 @@ class SupportBot:
                 last_name=user.last_name
             )
             logger.info(f"Created new chat for user {user_id}")
-        
-        welcome_message = (
-            f"👋 Здравствуйте, {user.first_name or 'пользователь'}!\n\n"
-            f"Я бот поддержки проекта {self.config.project_name or 'STELS-Support'}.\n"
-            "Я помогу вам с вопросами и проблемами.\n\n"
-            "Просто напишите ваш вопрос, и я постараюсь помочь!"
-        )
-        
-        # Если есть описание проекта, добавляем его
-        if self.config.project_description:
-            welcome_message += f"\n\n{self.config.project_description}"
-        
+
+        await self.refresh_runtime_settings()
+
+        class _SafeDict(dict):
+            def __missing__(self, key):
+                return "{" + key + "}"
+
+        ctx = {
+            "first_name": user.first_name or "пользователь",
+            "last_name": user.last_name or "",
+            "username": user.username or "",
+            "user_id": user_id,
+            "project_name": self._project_name,
+            "project_description": self._project_description,
+            "project_website": self._project_website,
+            "project_bot_link": self._project_bot_link,
+            "project_owner_contacts": self._project_owner_contacts,
+        }
+        try:
+            welcome_message = (self._welcome_template or "").format_map(_SafeDict(ctx)).strip()
+        except Exception:
+            welcome_message = ""
+        if not welcome_message:
+            welcome_message = f"👋 Здравствуйте, {ctx['first_name']}!\n\nЯ бот поддержки проекта {self._project_name}."
         await update.message.reply_text(welcome_message)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -425,6 +533,37 @@ class SupportBot:
             raise ValueError(f"Чат #{chat_id} не найден.")
         
         await self.db.update_chat_status(chat_id, "closed")
+        try:
+            chat.status = "closed"
+        except Exception:
+            pass
+
+        sysmsg = None
+        try:
+            sysmsg = await self.db.add_message(chat_id, chat.user_id, "Чат закрыт. AI активирован", "system")
+        except Exception as e:
+            logger.warning(f"Failed to save system message on close: {e}")
+
+        try:
+            if self.ws_manager:
+                await self.ws_manager.broadcast("status_changed", {"chat_id": chat_id, "status": "closed"})
+                if sysmsg:
+                    await self.ws_manager.broadcast(
+                        "new_message",
+                        {
+                            "chat_id": chat_id,
+                            "message": {
+                                "id": sysmsg.id,
+                                "text": getattr(sysmsg, "text", None) or sysmsg.content,
+                                "source": getattr(sysmsg, "source", None) or sysmsg.message_type,
+                                "created_at": sysmsg.created_at.isoformat() if sysmsg.created_at else None,
+                                "media_type": getattr(sysmsg, "media_type", None),
+                                "media_file_id": getattr(sysmsg, "media_file_id", None),
+                            },
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast ws updates on close: {e}")
         
         # Уведомляем пользователя
         try:
@@ -442,6 +581,37 @@ class SupportBot:
             await update.message.reply_text("❌ Чат не найден.")
             return
         await self.db.update_chat_status(chat_id, "active", manager_id=None)
+        try:
+            chat.status = "active"
+        except Exception:
+            pass
+
+        sysmsg = None
+        try:
+            sysmsg = await self.db.add_message(chat_id, chat.user_id, "Менеджер завершил сессию. AI активирован", "system")
+        except Exception as e:
+            logger.warning(f"Failed to save system message on AI reopen: {e}")
+
+        try:
+            if self.ws_manager:
+                await self.ws_manager.broadcast("status_changed", {"chat_id": chat_id, "status": "active"})
+                if sysmsg:
+                    await self.ws_manager.broadcast(
+                        "new_message",
+                        {
+                            "chat_id": chat_id,
+                            "message": {
+                                "id": sysmsg.id,
+                                "text": getattr(sysmsg, "text", None) or sysmsg.content,
+                                "source": getattr(sysmsg, "source", None) or sysmsg.message_type,
+                                "created_at": sysmsg.created_at.isoformat() if sysmsg.created_at else None,
+                                "media_type": getattr(sysmsg, "media_type", None),
+                                "media_file_id": getattr(sysmsg, "media_file_id", None),
+                            },
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast ws updates on AI reopen: {e}")
         try:
             await self.application.bot.send_message(
                 chat_id=chat.user_id,
@@ -609,6 +779,38 @@ class SupportBot:
             return
         
         await self.db.update_chat_status(chat_id, "waiting_manager", manager_id)
+        try:
+            chat.status = "waiting_manager"
+            chat.manager_id = manager_id
+        except Exception:
+            pass
+
+        sysmsg = None
+        try:
+            sysmsg = await self.db.add_message(chat_id, chat.user_id, "Менеджер подключился", "system")
+        except Exception as e:
+            logger.warning(f"Failed to save system message on join: {e}")
+
+        try:
+            if self.ws_manager:
+                await self.ws_manager.broadcast("status_changed", {"chat_id": chat_id, "status": "waiting_manager"})
+                if sysmsg:
+                    await self.ws_manager.broadcast(
+                        "new_message",
+                        {
+                            "chat_id": chat_id,
+                            "message": {
+                                "id": sysmsg.id,
+                                "text": getattr(sysmsg, "text", None) or sysmsg.content,
+                                "source": getattr(sysmsg, "source", None) or sysmsg.message_type,
+                                "created_at": sysmsg.created_at.isoformat() if sysmsg.created_at else None,
+                                "media_type": getattr(sysmsg, "media_type", None),
+                                "media_file_id": getattr(sysmsg, "media_file_id", None),
+                            },
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast ws updates on join: {e}")
         
         # Уведомляем пользователя
         try:
@@ -721,7 +923,7 @@ class SupportBot:
         
         if ai_response:
             # Сохраняем ответ AI
-            await self.db.add_message(chat.id, user_id, ai_response, "ai")
+            await self._save_message_to_db(chat.id, user_id, {"kind": "text", "text": ai_response}, "ai")
             
             # Проверяем, нужно ли предложить менеджера
             if any(keyword in ai_response.lower() for keyword in ["менеджер", "пригласить", "подключить"]):
@@ -757,6 +959,10 @@ class SupportBot:
         # Обновляем статус чата
         try:
             await self.db.update_chat_status(chat_id, "waiting_manager")
+            try:
+                chat.status = "waiting_manager"
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error updating chat status: {e}")
             try:
@@ -764,12 +970,55 @@ class SupportBot:
             except:
                 pass
             return
+
+        summary = None
+        try:
+            messages = await self.db.get_chat_messages(chat_id, limit=10)
+            last_user = next((m.content for m in reversed(messages) if m.message_type == "user"), None)
+            if last_user and self.config.ai_support_enabled:
+                prompt = f"Кратко, одной фразой опиши, чего хочет пользователь: {last_user}"
+                ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
+                hist = [{"role":"user" if m.message_type=="user" else "assistant","message":m.content} for m in messages]
+                summary = await self.ai.get_ai_answer(prompt, ctx, hist)
+        except Exception as e:
+            logger.warning(f"Failed to build AI summary: {e}")
+
+        sys_text = "🟡 Клиент запросил подключение менеджера"
+        if summary:
+            sys_text = f"{sys_text}\nКратко: {summary}"
+        sysmsg = None
+        try:
+            sysmsg = await self.db.add_message(chat_id, chat.user_id, sys_text, "system")
+        except Exception as e:
+            logger.warning(f"Failed to save system message on manager request: {e}")
+
+        try:
+            ws = getattr(self, "ws_manager", None)
+            if ws:
+                await ws.broadcast("status_changed", {"chat_id": chat_id, "status": "waiting_manager"})
+                if sysmsg:
+                    await ws.broadcast(
+                        "new_message",
+                        {
+                            "chat_id": chat_id,
+                            "message": {
+                                "id": sysmsg.id,
+                                "text": getattr(sysmsg, "text", None) or sysmsg.content,
+                                "source": getattr(sysmsg, "source", None) or "system",
+                                "created_at": sysmsg.created_at.isoformat() if sysmsg.created_at else None,
+                                "media_type": getattr(sysmsg, "media_type", None),
+                                "media_file_id": getattr(sysmsg, "media_file_id", None),
+                            },
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast ws updates on manager request: {e}")
         
         if self._group_id:
             try:
                 thread_id = await self._ensure_group_topic(chat)
                 if thread_id:
-                    name = f"{self._status_emoji(chat.status, 'client')} {chat.first_name or 'Пользователь'} ({chat.user_id}) Ожидает менеджера"
+                    name = self._format_topic_title(chat, "client")
                     try:
                         await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=thread_id, name=name)
                     except Exception as e:
@@ -780,17 +1029,6 @@ class SupportBot:
                         else:
                             raise
                     base = f"🟡 Пользователь запросил подключение менеджера\nПользователь: @{chat.username or 'N/A'}\nID: {chat.user_id}\nЧат: #{chat.id}"
-                    summary = None
-                    try:
-                        messages = await self.db.get_chat_messages(chat_id, limit=10)
-                        last_user = next((m.content for m in reversed(messages) if m.message_type == "user"), None)
-                        if last_user and self.config.ai_support_enabled:
-                            prompt = f"Кратко, одной фразой опиши, чего хочет пользователь: {last_user}"
-                            ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
-                            hist = [{"role":"user" if m.message_type=="user" else "assistant","message":m.content} for m in messages]
-                            summary = await self.ai.get_ai_answer(prompt, ctx, hist)
-                    except Exception as e:
-                        logger.warning(f"Failed to build AI summary: {e}")
                     text = base if not summary else f"{base}\nКратко: {summary}"
                     await self.application.bot.send_message(chat_id=self._group_id, text=self._md_to_html(text), message_thread_id=thread_id, disable_notification=False, parse_mode=ParseMode.HTML)
             except Exception as e:
@@ -915,7 +1153,7 @@ class SupportBot:
         
         welcome_text = (
             f"👋 Добро пожаловать!\n\n"
-            f"Я бот поддержки проекта {self.config.project_name or 'STELS-Support'}.\n"
+            f"Я бот поддержки проекта {self.config.project_name or 'DELTA-Support'}.\n"
             "Выберите действие или просто напишите ваш вопрос:"
         )
         
@@ -1009,7 +1247,33 @@ class SupportBot:
             "video_note": "[video_note] ",
         }.get(kind, "")
         content = f"{prefix}{text}".strip()
-        await self.db.add_message(chat_id, user_id, content, role)
+        msg = await self.db.add_message(chat_id, user_id, content, role)
+        file_id = info.get("file_id")
+        tg_message_id = info.get("message_id")
+        if file_id or kind != "text":
+            try:
+                from modules.database import Message as MessageModel
+                await MessageModel.filter(id=msg.id).update(media_type=kind, media_file_id=file_id, tg_message_id_user=tg_message_id)
+            except Exception:
+                pass
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast(
+                    "new_message",
+                    {
+                        "chat_id": chat_id,
+                        "message": {
+                            "id": msg.id,
+                            "text": getattr(msg, "text", None) or msg.content,
+                            "source": getattr(msg, "source", None) or msg.message_type,
+                            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                            "media_type": kind if kind != "text" else None,
+                            "media_file_id": file_id,
+                        },
+                    },
+                )
+            except Exception:
+                pass
 
     async def _send_to_client(self, client_chat_id: int, info: dict):
         header = await self.application.bot.send_message(chat_id=client_chat_id, text="👨‍💼 Менеджер поддержки")
@@ -1038,15 +1302,43 @@ class SupportBot:
             await self.application.bot.send_message(chat_id=client_chat_id, text=self._md_to_html(text or "Сообщение"), reply_to_message_id=header.message_id, parse_mode=ParseMode.HTML)
 
     def _status_emoji(self, status: str, role_hint: Optional[str] = None) -> str:
-        if role_hint == "client":
-            return "🔴"
-        if role_hint == "manager":
-            return "🟡"
-        if role_hint == "ai":
-            return "🤖"
-        return "🟢"
+        if role_hint and role_hint in self._emoji_by_role:
+            return self._emoji_by_role.get(role_hint) or self._emoji_by_role.get("default") or "🟢"
+        if status in self._emoji_by_status:
+            return self._emoji_by_status.get(status) or self._emoji_by_role.get("default") or "�"
+        return self._emoji_by_role.get("default") or "🟢"
+
+    def _status_label(self, status: str) -> str:
+        return {
+            "active": "AI",
+            "waiting_manager": "Ожидает менеджера",
+            "closed": "Закрыт",
+        }.get(status, status)
+
+    def _format_topic_title(self, chat, role_hint: Optional[str] = None) -> str:
+        emoji = self._status_emoji(getattr(chat, "status", ""), role_hint)
+        data = {
+            "emoji": emoji,
+            "status": getattr(chat, "status", ""),
+            "status_label": self._status_label(getattr(chat, "status", "")),
+            "first_name": getattr(chat, "first_name", None) or "Пользователь",
+            "last_name": getattr(chat, "last_name", None) or "",
+            "username": getattr(chat, "username", None) or "",
+            "user_id": getattr(chat, "user_id", ""),
+            "chat_id": getattr(chat, "id", ""),
+        }
+
+        class _SafeDict(dict):
+            def __missing__(self, key):
+                return "{" + key + "}"
+
+        try:
+            return (self._topic_title_template or "{emoji} {first_name} ({user_id}) {status_label}").format_map(_SafeDict(data)).strip()
+        except Exception:
+            return f"{emoji} {data['first_name']} ({data['user_id']}) {data['status_label']}".strip()
 
     async def _ensure_group_topic(self, chat) -> Optional[int]:
+        await self.refresh_runtime_settings()
         if not self._group_id:
             return None
         thread_key = f"group_topic:chat:{chat.id}"
@@ -1056,7 +1348,7 @@ class SupportBot:
                 return int(thread_id)
             except:
                 pass
-        name = f"{self._status_emoji(chat.status)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+        name = self._format_topic_title(chat, None)
         try:
             topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
             thread_id = getattr(topic, "message_thread_id", None)
@@ -1066,10 +1358,17 @@ class SupportBot:
         if thread_id and self.redis:
             self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
             self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
+        if thread_id:
+            try:
+                from modules.database import Chat as ChatModel
+                await ChatModel.filter(id=chat.id).update(topic_id=thread_id)
+            except Exception:
+                pass
         return thread_id
     
     async def _recreate_group_topic(self, chat, role_hint: Optional[str] = None) -> Optional[int]:
-        name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+        await self.refresh_runtime_settings()
+        name = self._format_topic_title(chat, role_hint)
         try:
             topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
             thread_id = getattr(topic, "message_thread_id", None)
@@ -1080,23 +1379,30 @@ class SupportBot:
             self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
             self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
             self.redis.delete(f"group_topic:pin:{thread_id}")
+        if thread_id:
+            try:
+                from modules.database import Chat as ChatModel
+                await ChatModel.filter(id=chat.id).update(topic_id=thread_id)
+            except Exception:
+                pass
         return thread_id
 
     async def _edit_group_topic_status(self, chat, role_hint: Optional[str] = None):
+        await self.refresh_runtime_settings()
         if not self._group_id or not self.redis:
             return
         thread_id = self.redis.get(f"group_topic:chat:{chat.id}")
         if not thread_id:
             return
         try:
-            name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+            name = self._format_topic_title(chat, role_hint)
             await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(thread_id), name=name)
         except Exception as e:
             if any(s in str(e).lower() for s in ["topic_deleted", "thread not found", "invalid thread"]):
                 new_thread = await self._recreate_group_topic(chat, role_hint)
                 if new_thread:
                     try:
-                        name = f"{self._status_emoji(chat.status, role_hint)} {chat.first_name or 'Пользователь'} ({chat.user_id})"
+                        name = self._format_topic_title(chat, role_hint)
                         await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(new_thread), name=name)
                     except Exception as e2:
                         logger.warning(f"Failed to edit recreated forum topic: {e2}")
@@ -1188,7 +1494,11 @@ class SupportBot:
             return True
         manager_id = chat.manager_id
         if not manager_id:
-            return False
+            try:
+                await update.message.reply_text("✅ Ваше сообщение сохранено. Менеджер скоро ответит.")
+            except Exception:
+                pass
+            return True
         signature = f"👤 Клиент: @{user.username}" if user.username else f"👤 Клиент: {user.first_name or 'Клиент'}"
         signature += f" 🆔 ID: {chat.id}"
         header = await self.application.bot.send_message(chat_id=manager_id, text=signature)
@@ -1318,7 +1628,7 @@ class SupportBot:
             context_info = {"user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
             ai_response = await self.ai.get_ai_answer(info["text"], context_info, chat_history)
             if ai_response:
-                await self.db.add_message(chat.id, user_id, ai_response, "ai")
+                await self._save_message_to_db(chat.id, user_id, {"kind": "text", "text": ai_response}, "ai")
                 if any(keyword in ai_response.lower() for keyword in ["менеджер", "пригласить", "подключить"]):
                     keyboard = [[InlineKeyboardButton("Да, пригласите менеджера", callback_data=f"request_manager_{chat.id}")]]
                     reply_markup = InlineKeyboardMarkup(keyboard)

@@ -6,12 +6,14 @@
 import os
 import logging
 import json
+import time
 import asyncpg
 import aiosqlite
 import httpx
 from typing import Optional, Dict, List
 from sqlalchemy import create_engine, text
 from modules.config import Config
+from modules.database import KnowledgeBaseEntry, SystemConfig
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,70 @@ class AISupport:
         # Индекс текущего ключа и модели для round-robin
         self.current_key_index = 0
         self.current_model_index = 0
+        self._runtime_settings_ts = 0.0
+        self._runtime_settings = {}
+        self._runtime_project_name = config.project_name or "DELTA-Support"
+        self._runtime_project_description = config.project_description or ""
+        self._runtime_project_website = config.project_website or ""
+        self._runtime_project_bot_link = config.project_bot_link or ""
+        self._runtime_project_owner_contacts = config.project_owner_contacts or ""
+        self._runtime_system_prompt = ""
+        self._runtime_db_keywords = None
+
+    async def _refresh_runtime_settings(self):
+        now = time.monotonic()
+        if now - self._runtime_settings_ts < 3.0:
+            return
+        keys = [
+            "project_name",
+            "project_description",
+            "project_website",
+            "project_bot_link",
+            "project_owner_contacts",
+            "ai_system_prompt",
+            "ai_support_api_type",
+            "ai_support_api_key",
+            "ai_support_api_keys",
+            "groq_models",
+            "ai_db_keywords",
+        ]
+        rows = await SystemConfig.filter(key__in=keys).all()
+        values = {r.key: (r.value or "") for r in rows}
+        self._runtime_settings = values
+        self._runtime_settings_ts = now
+
+        self._runtime_project_name = (values.get("project_name") or self.config.project_name or "DELTA-Support").strip()
+        self._runtime_project_description = (values.get("project_description") or self.config.project_description or "").strip()
+        self._runtime_project_website = (values.get("project_website") or self.config.project_website or "").strip()
+        self._runtime_project_bot_link = (values.get("project_bot_link") or self.config.project_bot_link or "").strip()
+        self._runtime_project_owner_contacts = (values.get("project_owner_contacts") or self.config.project_owner_contacts or "").strip()
+        self._runtime_system_prompt = (values.get("ai_system_prompt") or "").strip()
+
+        api_type = (values.get("ai_support_api_type") or self.config.ai_support_api_type or "groq").strip()
+        self.api_type = api_type
+
+        primary = (values.get("ai_support_api_key") or self.config.ai_support_api_key or "").strip()
+        many = (values.get("ai_support_api_keys") or self.config.ai_support_api_keys or "").strip()
+        keys_list = [k.strip() for k in many.split(",") if k.strip()] if many else []
+        if primary:
+            if primary not in keys_list:
+                keys_list.insert(0, primary)
+        self.api_keys = keys_list
+
+        groq_models = (values.get("groq_models") or self.config.groq_models or "").strip()
+        if groq_models:
+            self.models = [m.strip() for m in groq_models.split(",") if m.strip()]
+
+        dbkw = (values.get("ai_db_keywords") or "").strip()
+        if dbkw:
+            parts = []
+            for chunk in dbkw.replace("\n", ",").split(","):
+                t = chunk.strip()
+                if t:
+                    parts.append(t.lower())
+            self._runtime_db_keywords = parts or None
+        else:
+            self._runtime_db_keywords = None
     
     async def get_ai_answer(
         self, 
@@ -75,9 +141,10 @@ class AISupport:
         """
         if not self.enabled:
             return None
+        await self._refresh_runtime_settings()
         
         # Проверяем API ключ только для внешних API (не для rule-based)
-        if self.api_type != "rule-based" and not self.api_key:
+        if self.api_type != "rule-based" and not getattr(self, "api_keys", None):
             logger.warning("AI_SUPPORT_API_KEY не установлен для выбранного типа AI API")
             return None
         
@@ -95,53 +162,48 @@ class AISupport:
     
     async def _build_service_context(self, context: Optional[Dict] = None) -> str:
         """Построить контекст о сервисе для AI (с приоритетом БД)"""
+        await self._refresh_runtime_settings()
         service_info = []
         
         # Базовая информация о проекте
-        if self.config.project_name:
-            service_info.append(f"Название проекта: {self.config.project_name}")
-        if self.config.project_description:
-            service_info.append(f"Описание: {self.config.project_description}")
-        if self.config.project_website:
-            service_info.append(f"Официальный сайт: {self.config.project_website}")
-        if self.config.project_bot_link:
-            service_info.append(f"Telegram бот: {self.config.project_bot_link}")
-        if self.config.project_owner_contacts:
-            service_info.append(f"Контакты владельца: {self.config.project_owner_contacts}")
+        if self._runtime_project_name:
+            service_info.append(f"Название проекта: {self._runtime_project_name}")
+        if self._runtime_project_description:
+            service_info.append(f"Описание: {self._runtime_project_description}")
+        if self._runtime_project_website:
+            service_info.append(f"Официальный сайт: {self._runtime_project_website}")
+        if self._runtime_project_bot_link:
+            service_info.append(f"Telegram бот: {self._runtime_project_bot_link}")
+        if self._runtime_project_owner_contacts:
+            service_info.append(f"Контакты владельца: {self._runtime_project_owner_contacts}")
         
-        # Пытаемся получить расширенную информацию из БД проектов (приоритет)
+        admin_info = await self._get_service_info_from_admin_db()
         db_info = await self._get_service_info_from_db()
         
-        # Особенности сервиса
-        if db_info.get("features"):
-            service_info.append(f"\nОсобенности сервиса:\n{db_info['features']}")
-        elif self.config.service_features:
-            service_info.append(f"\nОсобенности сервиса:\n{self.config.service_features}")
-        
-        # Тарифы и цены
-        if db_info.get("tariffs"):
-            service_info.append(f"\nТарифы и цены:\n{db_info['tariffs']}")
-        elif self.config.service_tariffs:
-            service_info.append(f"\nТарифы и цены:\n{self.config.service_tariffs}")
-        
-        # Инструкции
-        if db_info.get("instructions"):
-            service_info.append(f"\nИнструкции по использованию:\n{db_info['instructions']}")
-        elif self.config.service_instructions:
-            service_info.append(f"\nИнструкции по использованию:\n{self.config.service_instructions}")
-        
-        # FAQ
-        if db_info.get("faq"):
-            service_info.append(f"\nЧасто задаваемые вопросы (FAQ):\n{db_info['faq']}")
-        elif self.config.service_faq:
-            service_info.append(f"\nЧасто задаваемые вопросы (FAQ):\n{self.config.service_faq}")
-        
-        # Часы работы поддержки
-        if db_info.get("support_hours"):
-            service_info.append(f"\nЧасы работы поддержки: {db_info['support_hours']}")
-        elif self.config.service_support_hours:
-            service_info.append(f"\nЧасы работы поддержки: {self.config.service_support_hours}")
-        
+        features = admin_info.get("features") or db_info.get("features") or self.config.service_features
+        if features:
+            service_info.append(f"\nОсобенности сервиса:\n{features}")
+
+        tariffs = admin_info.get("tariffs") or db_info.get("tariffs") or self.config.service_tariffs
+        if tariffs:
+            service_info.append(f"\nТарифы и цены:\n{tariffs}")
+
+        instructions = admin_info.get("instructions") or db_info.get("instructions") or self.config.service_instructions
+        if instructions:
+            service_info.append(f"\nИнструкции по использованию:\n{instructions}")
+
+        faq = admin_info.get("faq") or db_info.get("faq") or self.config.service_faq
+        if faq:
+            service_info.append(f"\nЧасто задаваемые вопросы (FAQ):\n{faq}")
+
+        support_hours = admin_info.get("support_hours") or db_info.get("support_hours") or self.config.service_support_hours
+        if support_hours:
+            service_info.append(f"\nЧасы работы поддержки: {support_hours}")
+
+        kb = await self._get_knowledge_base_text()
+        if kb:
+            service_info.append(f"\nБаза знаний:\n{kb}")
+
         # Информация о пользователе
         if context:
             user_info = []
@@ -156,6 +218,43 @@ class AISupport:
                 service_info.append(f"\nИнформация о пользователе:\n" + "\n".join(user_info))
         
         return "\n".join(service_info) if service_info else ""
+
+    async def _get_service_info_from_admin_db(self) -> Dict[str, str]:
+        info: Dict[str, str] = {}
+        keys = {
+            "service_features": "features",
+            "service_tariffs": "tariffs",
+            "service_instructions": "instructions",
+            "service_faq": "faq",
+            "service_support_hours": "support_hours",
+        }
+        try:
+            rows = await SystemConfig.filter(key__in=list(keys.keys())).all()
+            for r in rows:
+                mapped = keys.get(r.key)
+                if mapped:
+                    info[mapped] = r.value
+        except Exception:
+            return info
+        return info
+
+    async def _get_knowledge_base_text(self) -> str:
+        try:
+            rows = await KnowledgeBaseEntry.filter(is_active=True).order_by("-updated_at").all()
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        limit_chars = 8000
+        parts: List[str] = []
+        size = 0
+        for r in rows:
+            chunk = f"- {r.title}:\n{r.content}\n"
+            if size + len(chunk) > limit_chars:
+                break
+            parts.append(chunk)
+            size += len(chunk)
+        return "\n".join(parts).strip()
     
     async def _get_service_info_from_db(self) -> Dict[str, str]:
         """Получить информацию о сервисе из БД проектов (приоритет над .env)"""
@@ -580,8 +679,8 @@ class AISupport:
             service_context = await self._build_service_context(context)
             
             # Формируем системный промпт с информацией о сервисе
-            project_name = self.config.project_name or 'STELS-Support'
-            system_prompt = f"""Ты профессиональный помощник службы поддержки VPN проекта {project_name}.
+            project_name = self._runtime_project_name or "DELTA-Support"
+            default_prompt = """Ты профессиональный помощник службы поддержки VPN проекта {project_name}.
 
 ТВОЯ РОЛЬ:
 - Помогать пользователям решать их вопросы о VPN сервисе
@@ -607,6 +706,18 @@ class AISupport:
 {service_context}
 
 ВАЖНО: Если вопрос пользователя касается личных данных (баланс, подписка, тариф), но у тебя нет доступа к этой информации - предложи пользователю проверить личный кабинет или пригласить менеджера."""
+            tpl = self._runtime_system_prompt or default_prompt
+
+            class _SafeDict(dict):
+                def __missing__(self, key):
+                    return "{" + key + "}"
+
+            ctx = dict(context or {})
+            ctx.update({"project_name": project_name, "service_context": service_context})
+            try:
+                system_prompt = tpl.format_map(_SafeDict(ctx))
+            except Exception:
+                system_prompt = default_prompt.format_map(_SafeDict(ctx))
             
             # Пытаемся получить данные из БД проектов, если вопрос связан с данными
             project_data = None
@@ -614,7 +725,7 @@ class AISupport:
             question_lower = question.lower()
             
             # Расширенный список ключевых слов для запросов к БД
-            db_keywords = [
+            db_keywords = self._runtime_db_keywords or [
                 "пользователь", "подписка", "тариф", "баланс", "аккаунт", "профиль",
                 "цена", "стоимость", "оплата", "платеж", "subscription", "tariff",
                 "balance", "account", "profile", "price", "payment"

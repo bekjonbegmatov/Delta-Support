@@ -1,4 +1,4 @@
-# STELS-Support
+# DELTA-Support
 
 🤖 AI-powered support bot for VPN projects with Telegram integration
 
@@ -6,12 +6,12 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15+-blue)](https://www.postgresql.org/)
 [![Python](https://img.shields.io/badge/Python-3.11+-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-<img width="512" height="512" alt="stels" src="https://github.com/user-attachments/assets/633966b4-e0af-4144-9f3b-65031cfb22ac" />
+<img width="512" height="512" alt="delta" src="https://github.com/user-attachments/assets/633966b4-e0af-4144-9f3b-65031cfb22ac" />
 
 **📢 Присоединяйтесь к нашему сообществу:** [Telegram группа](https://t.me/stealthnet_group)
 ## 📋 Описание
 
-STELS-Support - это модульный бот поддержки на основе искусственного интеллекта для VPN проектов. Бот позволяет клиентам общаться с AI-помощником, который может помочь решить их вопросы. Если вопрос не может быть решен AI, бот предлагает пригласить менеджера в чат, после чего администраторы и менеджеры получают уведомления.
+DELTA-Support - это модульный бот поддержки на основе искусственного интеллекта для VPN проектов. Бот позволяет клиентам общаться с AI-помощником, который может помочь решить их вопросы. Если вопрос не может быть решен AI, бот предлагает пригласить менеджера в чат, после чего администраторы и менеджеры получают уведомления.
 
 ### ✨ Основные возможности
 
@@ -40,8 +40,8 @@ STELS-Support - это модульный бот поддержки на осн�
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone https://github.com/GOFONCK/STELS-Support.git
-cd STELS-Support
+git clone https://github.com/GOFONCK/DELTA-Support.git
+cd DELTA-Support
 ```
 
 2. **Запустите скрипт установки:**
@@ -120,7 +120,7 @@ TELEGRAM_MANAGER_IDS=8035667634,123456789
 
 ```env
 ### PROJECT INFO ###
-PROJECT_NAME=STELS-Support
+PROJECT_NAME=DELTA-Support
 PROJECT_DESCRIPTION=AI-powered support bot for VPN projects
 PROJECT_WEBSITE=https://example.com
 PROJECT_BOT_LINK=https://t.me/your_bot
@@ -132,10 +132,10 @@ AI_SUPPORT_API_TYPE=groq
 AI_SUPPORT_API_KEY=gsk_your_groq_api_key_here
 
 ### DATABASE ###
-DATABASE_URL=postgresql://stels_support:password@postgres:5432/stels_support
-POSTGRES_USER=stels_support
+DATABASE_URL=postgresql://delta_support:password@postgres:5432/delta_support
+POSTGRES_USER=delta_support
 POSTGRES_PASSWORD=your_secure_password
-POSTGRES_DB=stels_support
+POSTGRES_DB=delta_support
 
 ### TELEGRAM BOT ###
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
@@ -250,7 +250,7 @@ PROJECT_DB_1=postgresql://user:pass@container_name:5432/dbname
 ## 🏗️ Структура проекта
 
 ```
-STELS-Support/
+DELTA-Support/
 ├── modules/              # Модули приложения
 │   ├── bot.py           # Telegram бот
 │   ├── ai_support.py    # AI поддержка
@@ -318,10 +318,10 @@ docker compose up -d
 
 ```bash
 # Создать бэкап
-docker compose exec postgres pg_dump -U stels_support stels_support > backup.sql
+docker compose exec postgres pg_dump -U delta_support delta_support > backup.sql
 
 # Восстановить из бэкапа
-docker compose exec -T postgres psql -U stels_support stels_support < backup.sql
+docker compose exec -T postgres psql -U delta_support delta_support < backup.sql
 ```
 
 ## 🛠️ Разработка
@@ -343,9 +343,9 @@ nano .env  # Отредактируйте .env файл
 ```bash
 # Или используйте Docker для БД
 docker run -d --name postgres-dev \
-  -e POSTGRES_USER=stels_support \
+  -e POSTGRES_USER=delta_support \
   -e POSTGRES_PASSWORD=password \
-  -e POSTGRES_DB=stels_support \
+  -e POSTGRES_DB=delta_support \
   -p 5432:5432 \
   postgres:15-alpine
 ```
@@ -378,7 +378,7 @@ docker compose exec app python -c "from modules.database import Database; from m
 При обновлении структуры БД может потребоваться миграция. Пример миграции для изменения типов данных:
 
 ```bash
-docker compose exec postgres psql -U stels_support -d stels_support << 'EOF'
+docker compose exec postgres psql -U delta_support -d delta_support << 'EOF'
 ALTER TABLE chats ALTER COLUMN user_id TYPE BIGINT USING user_id::BIGINT;
 ALTER TABLE chats ALTER COLUMN manager_id TYPE BIGINT USING manager_id::BIGINT;
 EOF
@@ -487,17 +487,17 @@ curl -H "Authorization: Bearer YOUR_GROQ_KEY" https://api.groq.com/openai/v1/mod
 
 Приветствуются любые улучшения! Пожалуйста:
 
-1. Создайте Fork проекта: [Fork репозитория](https://github.com/GOFONCK/STELS-Support/fork)
+1. Создайте Fork проекта: [Fork репозитория](https://github.com/GOFONCK/DELTA-Support/fork)
 2. Создайте ветку для вашей функции (`git checkout -b feature/AmazingFeature`)
 3. Закоммитьте изменения (`git commit -m 'Add some AmazingFeature'`)
 4. Запушьте в ветку (`git push origin feature/AmazingFeature`)
-5. Откройте Pull Request: [Создать PR](https://github.com/GOFONCK/STELS-Support/compare)
+5. Откройте Pull Request: [Создать PR](https://github.com/GOFONCK/DELTA-Support/compare)
 
 ## 📞 Поддержка
 
 При возникновении проблем:
 
-1. Проверьте [Issues](https://github.com/GOFONCK/STELS-Support/issues)
+1. Проверьте [Issues](https://github.com/GOFONCK/DELTA-Support/issues)
 2. Создайте новый Issue с описанием проблемы
 3. Приложите логи: `docker compose logs app > logs.txt`
 

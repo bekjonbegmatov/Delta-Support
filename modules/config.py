@@ -12,7 +12,7 @@ class Config(BaseSettings):
     """Класс конфигурации приложения"""
     
     # Project info
-    project_name: str = Field(default="STELS-Support", alias="PROJECT_NAME")
+    project_name: str = Field(default="DELTA-Support", alias="PROJECT_NAME")
     project_description: str = Field(default="", alias="PROJECT_DESCRIPTION")
     project_website: str = Field(default="", alias="PROJECT_WEBSITE")
     project_bot_link: str = Field(default="", alias="PROJECT_BOT_LINK")
@@ -50,12 +50,12 @@ class Config(BaseSettings):
     
     # Database
     database_url: str = Field(
-        default="postgresql://stels_support:stels_support_password@postgres:5432/stels_support",
+        default="postgresql://delta_support:delta_support_password@postgres:5432/delta_support",
         alias="DATABASE_URL"
     )
-    postgres_user: str = Field(default="stels_support", alias="POSTGRES_USER")
-    postgres_password: str = Field(default="stels_support_password", alias="POSTGRES_PASSWORD")
-    postgres_db: str = Field(default="stels_support", alias="POSTGRES_DB")
+    postgres_user: str = Field(default="delta_support", alias="POSTGRES_USER")
+    postgres_password: str = Field(default="delta_support_password", alias="POSTGRES_PASSWORD")
+    postgres_db: str = Field(default="delta_support", alias="POSTGRES_DB")
     
     # Telegram Bot
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")

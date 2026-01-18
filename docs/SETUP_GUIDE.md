@@ -1,6 +1,6 @@
-# 📘 Подробное руководство по установке STELS-Support
+# 📘 Подробное руководство по установке DELTA-Support
 
-Это руководство поможет вам установить и настроить STELS-Support с нуля.
+Это руководство поможет вам установить и настроить DELTA-Support с нуля.
 
 ## 📋 Содержание
 
@@ -107,7 +107,7 @@ help - Справка
 
 1. После входа перейдите в раздел **API Keys** (в меню слева)
 2. Нажмите **Create API Key**
-3. Введите название ключа (например: "STELS-Support")
+3. Введите название ключа (например: "DELTA-Support")
 4. Нажмите **Submit**
 5. **Скопируйте ключ** сразу - он больше не будет показан!
 
@@ -179,8 +179,8 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone https://github.com/yourusername/STELS-Support.git
-cd STELS-Support
+git clone https://github.com/yourusername/DELTA-Support.git
+cd DELTA-Support
 ```
 
 2. **Запустите скрипт установки:**
@@ -198,7 +198,7 @@ chmod +x scripts/install.sh
 Настройка проекта
 ==========================================
 
-Название проекта [STELS-Support]: My VPN Support
+Название проекта [DELTA-Support]: My VPN Support
 Описание проекта: AI-powered support for VPN service
 Ссылка на сайт проекта (если есть): https://example.com
 Ссылка на бот проекта (если есть): https://t.me/my_vpn_support_bot
@@ -308,7 +308,7 @@ docker inspect <container_name> | grep -A 5 "Networks"
 3. **Отредактируйте `docker-compose.yml`:**
 ```yaml
 networks:
-  stels-network:
+  delta-network:
     driver: bridge
   external_network:
     external: true
@@ -319,7 +319,7 @@ networks:
 ```yaml
 app:
   networks:
-    - stels-network
+    - delta-network
     - external_network
 ```
 
@@ -341,9 +341,9 @@ docker compose ps
 Должно показать:
 ```
 NAME                  STATUS
-stels-support-app     Up
-stels-support-db      Up (healthy)
-stels-support-redis   Up (healthy)
+delta-support-app     Up
+delta-support-db      Up (healthy)
+delta-support-redis   Up (healthy)
 ```
 
 ### 2. Проверка логов
@@ -357,7 +357,7 @@ docker compose logs app --tail 20
 INFO | Database initialized
 INFO | Bot handlers registered
 INFO | Bot initialized
-INFO | Starting STELS-Support bot...
+INFO | Starting DELTA-Support bot...
 INFO | Bot started polling
 ```
 
@@ -418,7 +418,7 @@ INFO | Bot started polling
 
 Если у вас возникли проблемы:
 
-1. Проверьте [Issues](https://github.com/yourusername/STELS-Support/issues)
+1. Проверьте [Issues](https://github.com/yourusername/DELTA-Support/issues)
 2. Создайте новый Issue с:
    - Описанием проблемы
    - Логами: `docker compose logs app > logs.txt`

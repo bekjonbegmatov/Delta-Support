@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Панель управления - DELTA Support</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">DELTA Support</a>
+            <div class="d-flex text-white align-items-center">
+                <span class="me-3">{{ user.username }} ({{ user.role }})</span>
+                <a href="/logout" class="btn btn-outline-light btn-sm">Выход</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="row mb-4">
+            <div class="col-md-4">
+                <div class="card text-white bg-primary mb-3">
+                    <div class="card-header">Всего чатов</div>
+                    <div class="card-body">
+                        <h5 class="card-title">{{ stats.total }}</h5>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card text-white bg-warning mb-3">
+                    <div class="card-header">Ожидают ответа</div>
+                    <div class="card-body">
+                        <h5 class="card-title">{{ stats.waiting }}</h5>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card text-white bg-success mb-3">
+                    <div class="card-header">Активные</div>
+                    <div class="card-body">
+                        <h5 class="card-title">{{ stats.active }}</h5>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3>Последние чаты</h3>
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Пользователь</th>
+                    <th>Статус</th>
+                    <th>Обновлен</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for chat in chats %}
+                <tr>
+                    <td>{{ chat.id }}</td>
+                    <td>
+                        {% if chat.username %}@{{ chat.username }}{% else %}ID: {{ chat.user_id }}{% endif %}
+                        <br><small class="text-muted">{{ chat.first_name }} {{ chat.last_name }}</small>
+                    </td>
+                    <td>
+                        {% if chat.status == 'active' %}
+                        <span class="badge bg-success">Активен</span>
+                        {% elif chat.status == 'waiting_manager' %}
+                        <span class="badge bg-warning text-dark">Ждет менеджера</span>
+                        {% else %}
+                        <span class="badge bg-secondary">Закрыт</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ chat.updated_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <a href="/chats/{{ chat.id }}" class="btn btn-sm btn-primary">Открыть</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>

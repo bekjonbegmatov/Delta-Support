@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# STELS-Support Installation Script
+# DELTA-Support Installation Script
 # Автоматическая установка бота поддержки
 
 set -e
 
 echo "=========================================="
-echo "STELS-Support Installation Script"
+echo "DELTA-Support Installation Script"
 echo "=========================================="
 echo ""
 
@@ -79,8 +79,8 @@ echo "=========================================="
 echo ""
 
 # Запрос информации о проекте
-read -p "Название проекта [STELS-Support]: " PROJECT_NAME
-PROJECT_NAME=${PROJECT_NAME:-STELS-Support}
+read -p "Название проекта [DELTA-Support]: " PROJECT_NAME
+PROJECT_NAME=${PROJECT_NAME:-DELTA-Support}
 
 read -p "Описание проекта: " PROJECT_DESCRIPTION
 
@@ -188,8 +188,8 @@ fi
 
 # Генерация пароля для PostgreSQL
 POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-POSTGRES_USER="stels_support"
-POSTGRES_DB="stels_support"
+POSTGRES_USER="delta_support"
+POSTGRES_DB="delta_support"
 
 # Обновление .env файла
 info "Обновление файла .env..."
@@ -229,7 +229,7 @@ fi
 sed -i "s|^POSTGRES_USER=.*|POSTGRES_USER=$POSTGRES_USER|" .env
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" .env
 sed -i "s|^POSTGRES_DB=.*|POSTGRES_DB=$POSTGRES_DB|" .env
-sed -i "s|postgresql://.*@postgres:5432/stels_support|postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB|" .env
+sed -i "s|postgresql://.*@postgres:5432/delta_support|postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB|" .env
 
 sed -i "s|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=$JWT_SECRET|" .env
 

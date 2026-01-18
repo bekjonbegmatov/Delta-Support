@@ -16,6 +16,7 @@ class Chat(Model):
     """Модель чата"""
     id = fields.IntField(pk=True)
     user_id = fields.BigIntField(index=True)
+    user_tg_id = fields.BigIntField(index=True, null=True)
     username = fields.CharField(max_length=255, null=True)
     first_name = fields.CharField(max_length=255, null=True)
     last_name = fields.CharField(max_length=255, null=True)
@@ -23,6 +24,9 @@ class Chat(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     manager_id = fields.BigIntField(null=True)
+    assigned_admin_id = fields.IntField(null=True)
+    last_message_at = fields.DatetimeField(null=True)
+    topic_id = fields.BigIntField(null=True)
     
     # Reverse relations
     messages: fields.ReverseRelation["Message"]
@@ -39,6 +43,15 @@ class Message(Model):
     message_type = fields.CharField(max_length=50, default="user")  # user, ai, manager
     content = fields.TextField()
     created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    # Новые поля по ТЗ
+    source = fields.CharField(max_length=50, null=True)  # user | manager_web | manager_group | ai | system
+    text = fields.TextField(null=True)
+    media_type = fields.CharField(max_length=20, null=True)  # photo | video | document | audio | voice | sticker | none
+    media_file_id = fields.CharField(max_length=255, null=True)
+    tg_message_id_user = fields.BigIntField(null=True)
+    tg_message_id_group = fields.BigIntField(null=True)
+    admin_user_id = fields.IntField(null=True)
+    client_event_id = fields.CharField(max_length=64, null=True)
 
     class Meta:
         table = "messages"
@@ -63,6 +76,8 @@ class AdminUser(Model):
     is_active = fields.BooleanField(default=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     last_login = fields.DatetimeField(null=True)
+    access_start_hour = fields.IntField(null=True)
+    access_end_hour = fields.IntField(null=True)
 
     class Meta:
         table = "admin_users"
@@ -87,6 +102,17 @@ class ProjectDatabase(Model):
 
     class Meta:
         table = "project_databases"
+
+class KnowledgeBaseEntry(Model):
+    id = fields.IntField(pk=True)
+    title = fields.CharField(max_length=255)
+    content = fields.TextField()
+    is_active = fields.BooleanField(default=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "knowledge_base"
 
 class Database:
     """Класс для работы с базой данных (Wrapper для Tortoise ORM)"""
@@ -115,12 +141,54 @@ class Database:
         # Генерируем схему (создаем таблицы)
         await Tortoise.generate_schemas()
         logger.info("Database initialized and schemas generated")
+        
+        # Пытаться апгрейдить схему для существующих таблиц (SQLite без мигратора)
+        try:
+            if db_url.startswith("sqlite"):
+                conn = Tortoise.get_connection("default")
+                # Chat доп. колонки
+                for ddl in [
+                    "ALTER TABLE chats ADD COLUMN user_tg_id INTEGER",
+                    "ALTER TABLE chats ADD COLUMN assigned_admin_id INTEGER",
+                    "ALTER TABLE chats ADD COLUMN last_message_at TEXT",
+                    "ALTER TABLE chats ADD COLUMN topic_id INTEGER",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+                # Message доп. колонки
+                for ddl in [
+                    "ALTER TABLE messages ADD COLUMN source TEXT",
+                    "ALTER TABLE messages ADD COLUMN text TEXT",
+                    "ALTER TABLE messages ADD COLUMN media_type TEXT",
+                    "ALTER TABLE messages ADD COLUMN media_file_id TEXT",
+                    "ALTER TABLE messages ADD COLUMN tg_message_id_user INTEGER",
+                    "ALTER TABLE messages ADD COLUMN tg_message_id_group INTEGER",
+                    "ALTER TABLE messages ADD COLUMN admin_user_id INTEGER",
+                    "ALTER TABLE messages ADD COLUMN client_event_id TEXT",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+                for ddl in [
+                    "ALTER TABLE admin_users ADD COLUMN access_start_hour INTEGER",
+                    "ALTER TABLE admin_users ADD COLUMN access_end_hour INTEGER",
+                ]:
+                    try:
+                        await conn.execute_script(ddl)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     
     async def create_chat(self, user_id: int, username: str = None, 
                          first_name: str = None, last_name: str = None) -> Chat:
         """Создать новый чат"""
         chat = await Chat.create(
             user_id=user_id,
+            user_tg_id=user_id,
             username=username,
             first_name=first_name,
             last_name=last_name,
@@ -142,12 +210,22 @@ class Database:
     async def add_message(self, chat_id: int, user_id: int, 
                          content: str, message_type: str = "user") -> Message:
         """Добавить сообщение в чат"""
+        # Маппинг старой схемы в новую
+        source = {
+            "user": "user",
+            "ai": "ai",
+            "manager": "manager_web"
+        }.get(message_type, "system")
         message = await Message.create(
             chat_id=chat_id,
             user_id=user_id,
             message_type=message_type,
-            content=content
+            content=content,
+            source=source,
+            text=content
         )
+        # Обновляем last_message_at
+        await Chat.filter(id=chat_id).update(last_message_at=message.created_at)
         return message
     
     async def get_chat_messages(self, chat_id: int, limit: int = 50) -> List[Message]:

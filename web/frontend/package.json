@@ -1,0 +1,24 @@
+{
+  "name": "delta-support-admin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "pinia": "^2.1.7",
+    "vue-router": "^4.2.5",
+    "primevue": "^3.51.0",
+    "primeicons": "^7.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "vite": "^5.0.11",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "sass": "^1.69.5",
+    "@types/node": "^20.10.5"
+  }
+}
