@@ -101,10 +101,10 @@ compose_cmd() {
 }
 
 TTY_IN=""
-if [ -t 0 ]; then
-  TTY_IN="/dev/stdin"
-elif [ -r /dev/tty ]; then
+if [ -r /dev/tty ]; then
   TTY_IN="/dev/tty"
+elif [ -t 0 ]; then
+  TTY_IN="/dev/stdin"
 fi
 
 require_tty_or_env() {
