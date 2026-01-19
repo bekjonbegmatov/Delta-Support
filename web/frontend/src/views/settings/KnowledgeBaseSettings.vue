@@ -36,7 +36,7 @@
         <InputText v-model="form.title" placeholder="Название" />
         <Textarea v-model="form.content" autoResize rows="10" placeholder="Контент (текст/Markdown)" />
         <div style="display:flex; align-items:center; gap:10px;">
-          <input id="kb_active" v-model="form.is_active" type="checkbox" />
+          <Checkbox v-model="form.is_active" :binary="true" inputId="kb_active" />
           <label for="kb_active" class="muted" style="font-size: 13px;">Активно</label>
         </div>
         <div class="btn-row">
@@ -59,6 +59,7 @@ import Tag from 'primevue/tag'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
 import Textarea from 'primevue/textarea'
+import Checkbox from 'primevue/checkbox'
 
 type Row = { id: number; title: string; content: string; is_active: boolean; updated_at: string }
 
@@ -135,4 +136,3 @@ async function remove(r: Row) {
 
 onMounted(load)
 </script>
-

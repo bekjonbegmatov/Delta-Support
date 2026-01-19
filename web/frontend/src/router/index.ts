@@ -10,6 +10,7 @@ import ProfileSettings from '@/views/settings/ProfileSettings.vue'
 import UsersSettings from '@/views/settings/UsersSettings.vue'
 import TelegramSettings from '@/views/settings/TelegramSettings.vue'
 import BotSettings from '@/views/settings/BotSettings.vue'
+import NotFound from '@/views/NotFound.vue'
 
 async function isAuthed() {
   const res = await fetch('/api/auth/me', { credentials: 'include' })
@@ -40,7 +41,8 @@ const routes = [
       { path: 'profile', component: ProfileSettings },
       { path: 'users', component: UsersSettings }
     ]
-  }
+  },
+  { path: '/:pathMatch(.*)*', component: NotFound }
 ]
 
 const router = createRouter({
@@ -63,7 +65,7 @@ router.beforeEach(async (to) => {
     if (to.path.startsWith('/settings') && me.role !== 'admin') return '/chats'
     return true
   } catch {
-    return true
+    return '/login'
   }
 })
 

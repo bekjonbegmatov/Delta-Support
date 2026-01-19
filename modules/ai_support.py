@@ -78,6 +78,7 @@ class AISupport:
             "project_bot_link",
             "project_owner_contacts",
             "ai_system_prompt",
+            "ai_support_enabled",
             "ai_support_api_type",
             "ai_support_api_key",
             "ai_support_api_keys",
@@ -95,6 +96,12 @@ class AISupport:
         self._runtime_project_bot_link = (values.get("project_bot_link") or self.config.project_bot_link or "").strip()
         self._runtime_project_owner_contacts = (values.get("project_owner_contacts") or self.config.project_owner_contacts or "").strip()
         self._runtime_system_prompt = (values.get("ai_system_prompt") or "").strip()
+
+        enabled_raw = values.get("ai_support_enabled")
+        if enabled_raw is None or str(enabled_raw).strip() == "":
+            self.enabled = bool(self.config.ai_support_enabled)
+        else:
+            self.enabled = str(enabled_raw).strip().lower() in ["1", "true", "yes", "y", "on"]
 
         api_type = (values.get("ai_support_api_type") or self.config.ai_support_api_type or "groq").strip()
         self.api_type = api_type
@@ -139,9 +146,9 @@ class AISupport:
         Returns:
             Ответ от AI или None в случае ошибки
         """
+        await self._refresh_runtime_settings()
         if not self.enabled:
             return None
-        await self._refresh_runtime_settings()
         
         # Проверяем API ключ только для внешних API (не для rule-based)
         if self.api_type != "rule-based" and not getattr(self, "api_keys", None):
