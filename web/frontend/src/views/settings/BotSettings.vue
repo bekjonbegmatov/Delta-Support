@@ -48,6 +48,12 @@
         <div class="panel" style="border-radius: 16px; padding: 12px;">
           <div class="muted" style="font-size: 12px; margin-bottom: 10px;">AI</div>
           <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+            <div style="grid-column: 1 / -1;">
+              <div style="display:flex; align-items:center; gap:10px;">
+                <Checkbox v-model="form.ai_support_enabled" :binary="true" />
+                <span>AI включён</span>
+              </div>
+            </div>
             <div>
               <div class="muted" style="font-size: 12px; margin-bottom: 6px;">API тип</div>
               <InputText v-model="form.ai_support_api_type" placeholder="groq" style="width: 100%;" />
@@ -81,14 +87,14 @@
                   <Button size="small" icon="pi pi-trash" text @click="removeKey(idx)" />
                 </div>
               </div>
-              <label v-if="secretsPreview.ai_support_api_keys_count && !clearAllKeys" style="display:flex; align-items:center; gap:10px; margin-top: 10px;">
-                <input v-model="appendKeys" type="checkbox" />
+              <div v-if="secretsPreview.ai_support_api_keys_count && !clearAllKeys" style="display:flex; align-items:center; gap:10px; margin-top: 10px;">
+                <Checkbox v-model="appendKeys" :binary="true" />
                 <span>Добавлять к сохранённым (а не заменять)</span>
-              </label>
-              <label style="display:flex; align-items:center; gap:10px; margin-top: 10px;">
-                <input v-model="clearAllKeys" type="checkbox" />
+              </div>
+              <div style="display:flex; align-items:center; gap:10px; margin-top: 10px;">
+                <Checkbox v-model="clearAllKeys" :binary="true" />
                 <span>Очистить сохранённые ключи</span>
-              </label>
+              </div>
             </div>
           </div>
         </div>
@@ -104,6 +110,7 @@ import { onMounted, ref } from 'vue'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
 import Textarea from 'primevue/textarea'
+import Checkbox from 'primevue/checkbox'
 import { useAuthStore } from '@/stores/auth'
 import HelpTip from '@/components/HelpTip.vue'
 
@@ -118,6 +125,7 @@ const form = ref({
   project_owner_contacts: '',
   bot_welcome_message: '',
   ai_system_prompt: '',
+  ai_support_enabled: true,
   ai_support_api_type: 'groq',
   groq_models: ''
 })
@@ -145,7 +153,11 @@ async function load() {
     return
   }
   const data = await res.json()
-  form.value = { ...form.value, ...(data.effective || {}) }
+  const incoming: any = data.effective || {}
+  if (typeof incoming.ai_support_enabled === 'string') {
+    incoming.ai_support_enabled = ['1', 'true', 'yes', 'y', 'on'].includes(incoming.ai_support_enabled.trim().toLowerCase())
+  }
+  form.value = { ...form.value, ...incoming }
   secrets.value = data.secrets || secrets.value
   secretsPreview.value = data.secrets_preview || secretsPreview.value
   keys.value = ['']

@@ -137,6 +137,16 @@ prompt_secret() {
   echo "$var"
 }
 
+is_telegram_token() {
+  local v="${1:-}"
+  [[ "$v" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]
+}
+
+is_groq_key() {
+  local v="${1:-}"
+  [[ "$v" =~ ^gsk_[A-Za-z0-9]{10,} ]]
+}
+
 generate_secret() {
   if need_cmd python3; then
     python3 - <<'PY'
@@ -218,6 +228,13 @@ if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
   error "TELEGRAM_BOT_TOKEN обязателен."
   exit 1
 fi
+if is_groq_key "$TELEGRAM_BOT_TOKEN"; then
+  error "Похоже, вы вставили Groq ключ (gsk_...) вместо Telegram Bot Token (формат 123456:ABC...)."
+  exit 1
+fi
+if ! is_telegram_token "$TELEGRAM_BOT_TOKEN"; then
+  warn "Токен бота выглядит нестандартно. Обычно формат такой: 123456:ABCdef..."
+fi
 TELEGRAM_ADMIN_IDS="${TELEGRAM_ADMIN_IDS:-}"
 TELEGRAM_MANAGER_IDS="${TELEGRAM_MANAGER_IDS:-}"
 if [ -z "$TELEGRAM_ADMIN_IDS" ]; then TELEGRAM_ADMIN_IDS="$(prompt "ID администраторов (через запятую)" "")"; fi
@@ -249,6 +266,9 @@ if [ "$AI_ENABLED" = "y" ] || [ "$AI_ENABLED" = "Y" ]; then
   else
     AI_SUPPORT_API_TYPE="groq"
     if [ -z "$AI_SUPPORT_API_KEY" ]; then AI_SUPPORT_API_KEY="$(prompt_secret "Groq API ключ")"; fi
+    if [ -n "$AI_SUPPORT_API_KEY" ] && ! is_groq_key "$AI_SUPPORT_API_KEY"; then
+      warn "Groq ключ выглядит нестандартно. Обычно начинается с gsk_."
+    fi
   fi
 fi
 

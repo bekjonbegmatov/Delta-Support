@@ -268,6 +268,7 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
         "project_owner_contacts",
         "bot_welcome_message",
         "ai_system_prompt",
+        "ai_support_enabled",
         "ai_support_api_type",
         "ai_support_api_key",
         "ai_support_api_keys",
@@ -312,6 +313,7 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
             "ВАЖНО: Если вопрос пользователя касается личных данных (баланс, подписка, тариф), но у тебя нет доступа к этой информации - "
             "предложи пользователю проверить личный кабинет или пригласить менеджера."
         ),
+        "ai_support_enabled": bool(cfg.ai_support_enabled),
         "ai_support_api_type": cfg.ai_support_api_type or "groq",
         "ai_support_api_key": "",
         "ai_support_api_keys": "",
@@ -322,7 +324,13 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
         raw = values.get(k)
         if k in ["ai_system_prompt", "bot_welcome_message"] and raw is not None and str(raw).strip() == "":
             raw = None
-        effective[k] = raw if raw is not None else defaults.get(k, "")
+        if k == "ai_support_enabled":
+            if raw is None:
+                effective[k] = bool(defaults.get(k))
+            else:
+                effective[k] = str(raw).strip().lower() in ["1", "true", "yes", "y", "on"]
+        else:
+            effective[k] = raw if raw is not None else defaults.get(k, "")
     ai_key_set = bool((values.get("ai_support_api_key") or "").strip() or (cfg.ai_support_api_key or "").strip())
     ai_keys_set = bool((values.get("ai_support_api_keys") or "").strip() or (cfg.ai_support_api_keys or "").strip())
 
@@ -365,6 +373,7 @@ async def put_bot_settings(request: Request, user: AdminUser = Depends(get_curre
         "project_owner_contacts": "Проект: контакты владельца",
         "bot_welcome_message": "Бот: приветственное сообщение",
         "ai_system_prompt": "AI: system prompt",
+        "ai_support_enabled": "AI: enabled",
         "ai_support_api_type": "AI: API type",
         "groq_models": "AI: модели Groq",
     }
@@ -375,7 +384,10 @@ async def put_bot_settings(request: Request, user: AdminUser = Depends(get_curre
         if v is None or (k in ["ai_system_prompt", "bot_welcome_message"] and str(v).strip() == ""):
             await SystemConfig.filter(key=k).delete()
         else:
-            await SystemConfig.update_or_create(key=k, defaults={"value": str(v), "description": desc})
+            if k == "ai_support_enabled":
+                await SystemConfig.update_or_create(key=k, defaults={"value": "true" if bool(v) else "false", "description": desc})
+            else:
+                await SystemConfig.update_or_create(key=k, defaults={"value": str(v), "description": desc})
     if "ai_support_api_key" in body:
         v = body.get("ai_support_api_key")
         if v is None or str(v).strip() == "":
