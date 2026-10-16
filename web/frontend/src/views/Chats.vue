@@ -375,6 +375,7 @@ function avatarLabel(c: Chat) {
 function bubbleKind(m: Msg) {
   const s = (m.source || '').toLowerCase()
   if (s.includes('manager')) return 'manager'
+  if (s === 'ai_tool') return 'ai-tool'
   if (s === 'ai') return 'ai'
   if (s === 'system') return 'system'
   return 'user'
@@ -383,6 +384,7 @@ function bubbleKind(m: Msg) {
 function bubbleLabel(m: Msg) {
   const k = bubbleKind(m)
   if (k === 'manager') return 'Менеджер'
+  if (k === 'ai-tool') return 'AI-инструмент'
   if (k === 'ai') return 'AI'
   if (k === 'system') return 'Система'
   return 'Клиент'

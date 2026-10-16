@@ -23,13 +23,24 @@ from loguru import logger
 from typing import Optional
 
 from modules.config import Config
-from modules.database import Database, SystemConfig
+from modules.database import Database, Message, SystemConfig
 from modules.ai_support import AISupport
 from modules.user_info import UserInfoService, PendingAction
 
 
 class SupportBot:
     """Класс бота поддержки"""
+
+    _AI_TOOL_LABELS = {
+        "get_payment_methods": "Получить способы оплаты",
+        "create_payment": "Создать ссылку на оплату",
+        "check_payment": "Проверить платёж",
+        "get_subscription_info": "Получить данные подписки",
+        "get_subscription_devices": "Получить устройства подписки",
+        "reset_devices": "Сбросить все устройства",
+        "delete_device": "Удалить устройство",
+        "revoke_subscription": "Перевыпустить подписку",
+    }
     
     def __init__(self, config: Config, database: Database):
         self.config = config
@@ -129,6 +140,114 @@ class SupportBot:
         except Exception:
             pass
 
+    @classmethod
+    def _sanitize_ai_tool_data(cls, value, depth: int = 0):
+        if depth > 3:
+            return "…"
+        if isinstance(value, dict):
+            result = {}
+            for key, item in list(value.items())[:24]:
+                key_lower = str(key).lower()
+                if any(secret in key_lower for secret in ("token", "password", "secret", "authorization", "api_key")):
+                    result[str(key)] = "[hidden]"
+                else:
+                    result[str(key)] = cls._sanitize_ai_tool_data(item, depth + 1)
+            if len(value) > 24:
+                result["…"] = f"ещё {len(value) - 24} полей"
+            return result
+        if isinstance(value, (list, tuple)):
+            items = [cls._sanitize_ai_tool_data(item, depth + 1) for item in list(value)[:10]]
+            if len(value) > 10:
+                items.append(f"… ещё {len(value) - 10}")
+            return items
+        if isinstance(value, str) and len(value) > 600:
+            return value[:600] + "…"
+        return value
+
+    @classmethod
+    def _format_ai_tool_event(cls, event: dict) -> str:
+        phase = str(event.get("phase") or "event")
+        tool = str(event.get("tool") or event.get("action") or "")
+        label = cls._AI_TOOL_LABELS.get(tool, tool or "AI")
+        titles = {
+            "requested": "AI вызвал инструмент",
+            "result": "Инструмент вернул результат",
+            "pending": "Ожидается подтверждение клиента",
+            "confirmation_sent": "Клиенту отправлен запрос подтверждения",
+            "confirmed": "Клиент подтвердил действие",
+            "cancelled": "Клиент отменил действие",
+            "action_result": "Действие выполнено",
+            "client_message": "AI отправил сообщение клиенту",
+            "delivery_failed": "Не удалось отправить сообщение клиенту",
+        }
+        lines = [f"AI-инструмент · {titles.get(phase, phase)}", f"Инструмент: {label}"]
+        if event.get("provider"):
+            provider = str(event.get("provider"))
+            model = str(event.get("model") or "").strip()
+            lines.append(f"Провайдер: {provider}" + (f" ({model})" if model else ""))
+        if event.get("transport") == "text_fallback":
+            lines.append("Источник вызова: текстовый fallback провайдера")
+        elif event.get("transport") == "deterministic_intent":
+            lines.append("Источник вызова: обработчик намерения")
+        payload = event.get("args") if phase == "requested" else event.get("result")
+        if phase == "confirmation_sent":
+            payload = {
+                "params": event.get("params") or {},
+                "message": (event.get("result") or {}).get("message"),
+            }
+        elif phase in {"confirmed", "cancelled"}:
+            payload = event.get("params") or event.get("result")
+        if phase in {"client_message", "delivery_failed"}:
+            payload = {"message": event.get("message")}
+        if payload not in (None, {}, []):
+            safe_payload = cls._sanitize_ai_tool_data(payload)
+            rendered = json.dumps(safe_payload, ensure_ascii=False, indent=2, default=str)
+            lines.append("Данные:\n" + rendered)
+        return "\n".join(lines)[:3900]
+
+    async def _record_ai_tool_event(self, chat, event: dict):
+        if not chat:
+            return
+        text = self._format_ai_tool_event(event)
+        try:
+            msg = await Message.create(
+                chat_id=chat.id,
+                user_id=chat.user_id,
+                message_type="system",
+                source="ai_tool",
+                content=text,
+                text=text,
+            )
+            if self.ws_manager:
+                await self.ws_manager.broadcast(
+                    "new_message",
+                    {
+                        "chat_id": chat.id,
+                        "message": {
+                            "id": msg.id,
+                            "text": text,
+                            "source": "ai_tool",
+                            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                            "media_type": None,
+                            "media_file_id": None,
+                        },
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"Failed to save AI tool audit event: {e}")
+        if self._group_id and self.application:
+            try:
+                thread_id = await self._ensure_group_topic(chat)
+                if thread_id:
+                    await self.application.bot.send_message(
+                        chat_id=self._group_id,
+                        text=text,
+                        message_thread_id=thread_id,
+                        disable_notification=True,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to send AI tool audit event to topic: {e}")
+
     @staticmethod
     def _plain_match_text(value) -> str:
         return " ".join(re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", str(value or "").lower()))
@@ -224,6 +343,15 @@ class SupportBot:
                 action="delete_device",
                 params={"subscription_username": username, "hwid": self._device_hwid(best_device), "device_label": label},
                 confirm_text=f"Подтвердите удаление устройства «{label}» из подписки «{best_sub.get('tarif') or username}».",
+            )
+            await self._record_ai_tool_event(
+                chat,
+                {
+                    "phase": "requested",
+                    "tool": action.action,
+                    "args": action.params,
+                    "transport": "deterministic_intent",
+                },
             )
             await self._send_pending_action_confirmation(update, chat, action)
             return True
@@ -1111,6 +1239,7 @@ class SupportBot:
                 "message": msg.content
             }
             for msg in chat_messages
+            if (getattr(msg, "source", None) or "") != "ai_tool"
         ]
         
         # Получаем ответ от AI
@@ -1331,7 +1460,11 @@ class SupportBot:
                 "Пиши сухо и по делу, без приветствий и обращений к клиенту."
             )
             ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
-            hist = [{"role": "user" if m.message_type == "user" else "assistant", "message": m.content} for m in messages]
+            hist = [
+                {"role": "user" if m.message_type == "user" else "assistant", "message": m.content}
+                for m in messages
+                if (getattr(m, "source", None) or "") != "ai_tool"
+            ]
             return await self.ai.get_ai_answer(prompt, ctx, hist)
         except Exception as e:
             logger.warning(f"Failed to build AI summary: {e}")
@@ -1691,6 +1824,15 @@ class SupportBot:
         ]])
         try:
             await update.message.reply_text(action.confirm_text, reply_markup=keyboard)
+            await self._record_ai_tool_event(
+                chat,
+                {
+                    "phase": "confirmation_sent",
+                    "tool": action.action,
+                    "params": action.params,
+                    "result": {"message": action.confirm_text},
+                },
+            )
         except Exception as e:
             logger.warning(f"Failed to send pending action confirmation: {e}")
         try:
@@ -1732,9 +1874,15 @@ class SupportBot:
         chat_id = entry.get("chat_id")
         action_name = entry.get("action")
         params = entry.get("params") or {}
+        chat = await self.db.get_chat_by_id(chat_id) if chat_id else None
+        await self._record_ai_tool_event(
+            chat,
+            {"phase": "confirmed", "tool": action_name, "params": params},
+        )
 
         result_text = "❌ Неизвестное действие."
         result_markup = None
+        audit_result = None
         try:
             if action_name == "create_payment":
                 operation_id = params.get("idempotency_key")
@@ -1744,6 +1892,7 @@ class SupportBot:
                     amount=params.get("amount"),
                     idempotency_key=operation_id,
                 )
+                audit_result = res
                 if res and res.get("ok"):
                     pay_link = str(res.get("pay_link") or "").strip()
                     order_id = res.get("order_id") or "—"
@@ -1786,6 +1935,7 @@ class SupportBot:
                     result_text = "❌ Подписка больше не найдена среди ваших — действие отменено."
                 else:
                     res = await self.user_info.reset_devices(params.get("short_id") or owned.get("short_id"))
+                    audit_result = res
                     result_text = (
                         "✅ Все устройства подписки сброшены."
                         if res and res.get("ok")
@@ -1798,6 +1948,7 @@ class SupportBot:
                     result_text = "❌ Подписка больше не найдена среди ваших — действие отменено."
                 else:
                     res = await self.user_info.revoke_subscription(username)
+                    audit_result = res
                     if res and res.get("ok"):
                         result_text = "✅ Подписка перевыпущена. Зайдите в личный кабинет за новой ссылкой."
                     elif res and res.get("error") == "subscription_too_new":
@@ -1813,18 +1964,42 @@ class SupportBot:
                     result_text = "❌ Устройство или подписка больше не найдены — действие отменено."
                 else:
                     res = await self.user_info.delete_device(username, hwid)
+                    audit_result = res
                     result_text = "✅ Устройство удалено." if res and res.get("ok") else "❌ Не удалось удалить устройство. Попробуйте позже."
         except Exception as e:
             logger.error(f"Pending action execution failed ({action_name}): {e}")
+            audit_result = {"ok": False, "error": str(e)}
             result_text = "❌ Произошла ошибка при выполнении. Обратитесь к менеджеру."
 
+        delivered = False
         try:
             await query.edit_message_text(result_text, reply_markup=result_markup)
+            delivered = True
         except Exception:
             try:
                 await query.message.reply_text(result_text, reply_markup=result_markup)
+                delivered = True
             except Exception:
                 pass
+        await self._record_ai_tool_event(
+            chat,
+            {
+                "phase": "action_result",
+                "tool": action_name,
+                "result": {
+                    "backend": audit_result,
+                    "client_message": result_text,
+                },
+            },
+        )
+        await self._record_ai_tool_event(
+            chat,
+            {
+                "phase": "client_message" if delivered else "delivery_failed",
+                "tool": action_name,
+                "message": result_text,
+            },
+        )
         if chat_id:
             try:
                 await self._save_message_to_db(chat_id, user_id, {"kind": "text", "text": result_text}, "system")
@@ -1839,11 +2014,21 @@ class SupportBot:
             except Exception:
                 pass
             return
-        self._pop_pending_action(token)
+        entry = self._pop_pending_action(token)
         try:
             await query.edit_message_text("Отменено.")
         except Exception:
             pass
+        if entry:
+            chat = await self.db.get_chat_by_id(entry.get("chat_id")) if entry.get("chat_id") else None
+            await self._record_ai_tool_event(
+                chat,
+                {
+                    "phase": "cancelled",
+                    "tool": entry.get("action"),
+                    "params": entry.get("params") or {},
+                },
+            )
 
     # ------------------------------------------------------------------
     # Автоматизация: автозакрытие неактивных чатов и SLA-пинги
@@ -2804,10 +2989,22 @@ class SupportBot:
         if question_text:
             if await self._maybe_send_device_delete_confirmation(update, chat, user_id, question_text):
                 return
+            tool_audit_state = {"seen": False, "last_tool": None}
+
+            async def tool_event_callback(event: dict):
+                tool_audit_state["seen"] = True
+                if event.get("tool"):
+                    tool_audit_state["last_tool"] = event.get("tool")
+                await self._record_ai_tool_event(chat, event)
+
             typing_stop, typing_task = self._start_typing(update.effective_chat.id if update.effective_chat else user_id)
             try:
                 chat_messages = await self.db.get_chat_messages(chat.id, limit=20)
-                chat_history = [{"role": "user" if msg.message_type == "user" else "assistant", "message": msg.content} for msg in chat_messages]
+                chat_history = [
+                    {"role": "user" if msg.message_type == "user" else "assistant", "message": msg.content}
+                    for msg in chat_messages
+                    if (getattr(msg, "source", None) or "") != "ai_tool"
+                ]
                 context_info = {"user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
                 # Данные аккаунта клиента из Support API (баланс, подписки, ключи)
                 try:
@@ -2819,6 +3016,7 @@ class SupportBot:
                 ai_response = await self.ai.get_ai_answer(
                     question_text, context_info, chat_history, image_data_url=image_data_url,
                     execute_tools=True, user_info_service=self.user_info,
+                    tool_event_callback=tool_event_callback,
                 )
             finally:
                 await self._stop_typing(typing_stop, typing_task)
@@ -2832,6 +3030,15 @@ class SupportBot:
                     await update.message.reply_text(self._md_to_html(ai_response), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
                 else:
                     await update.message.reply_text(self._md_to_html(ai_response), parse_mode=ParseMode.HTML)
+                if tool_audit_state["seen"]:
+                    await self._record_ai_tool_event(
+                        chat,
+                        {
+                            "phase": "client_message",
+                            "tool": tool_audit_state["last_tool"],
+                            "message": ai_response,
+                        },
+                    )
                 if self._group_id:
                     try:
                         thread_id = await self._ensure_group_topic(chat)

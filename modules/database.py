@@ -53,7 +53,7 @@ class Message(Model):
     content = fields.TextField()
     created_at = fields.DatetimeField(auto_now_add=True, index=True)
     # Новые поля по ТЗ
-    source = fields.CharField(max_length=50, null=True)  # user | manager_web | manager_group | ai | system
+    source = fields.CharField(max_length=50, null=True)  # user | manager_web | manager_group | ai | ai_tool | system
     text = fields.TextField(null=True)
     media_type = fields.CharField(max_length=20, null=True)  # photo | video | document | audio | voice | sticker | none
     media_file_id = fields.CharField(max_length=255, null=True)
