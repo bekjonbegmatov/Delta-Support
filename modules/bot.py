@@ -1747,6 +1747,11 @@ class SupportBot:
                 pass
             return
 
+        try:
+            await query.answer("Выполняю действие…")
+        except Exception:
+            pass
+
         entry = self._pop_pending_action(token)
         if not entry:
             try:
@@ -1760,8 +1765,52 @@ class SupportBot:
         params = entry.get("params") or {}
 
         result_text = "❌ Неизвестное действие."
+        result_markup = None
         try:
-            if action_name == "reset_devices":
+            if action_name == "create_payment":
+                operation_id = params.get("idempotency_key")
+                res = await self.user_info.create_payment_link(
+                    owner_telegram_id=user_id,
+                    method=params.get("method"),
+                    amount=params.get("amount"),
+                    idempotency_key=operation_id,
+                )
+                if res and res.get("ok"):
+                    pay_link = str(res.get("pay_link") or "").strip()
+                    order_id = res.get("order_id") or "—"
+                    amount = res.get("amount") or params.get("amount")
+                    currency = res.get("currency") or params.get("currency") or "RUB"
+                    result_text = f"Счёт создан на {amount} {currency}.\nНомер: {order_id}"
+                    if pay_link:
+                        result_text += f"\n\nСсылка для оплаты:\n{pay_link}"
+                        if pay_link.startswith(("https://", "http://")):
+                            result_markup = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Перейти к оплате", url=pay_link)
+                            ]])
+                else:
+                    error = (res or {}).get("error") or "request_failed"
+                    operation_id = (res or {}).get("operation_id") or operation_id
+                    messages = {
+                        "invalid_token": "Платёжная интеграция временно недоступна: токен Support API отклонён.",
+                        "user_not_found": "Пользователь не найден в платёжной системе.",
+                        "user_blocked": "Пополнение недоступно: пользователь заблокирован.",
+                        "captcha_required": "Сначала необходимо пройти капчу в основном боте.",
+                        "unsupported_method": "Выбранный способ оплаты не поддерживается.",
+                        "method_unavailable": "Выбранный способ оплаты сейчас недоступен.",
+                        "invalid_amount": "Сумма пополнения должна быть от 50 до 9999 рублей.",
+                        "idempotency_conflict": "Параметры этого платёжного намерения изменились. Требуется проверка поддержкой.",
+                        "operation_requires_review": "Операция требует проверки поддержкой.",
+                        "previous_operation_requires_review": "Предыдущая платёжная операция требует проверки поддержкой.",
+                    }
+                    if error in {"checkout_uncertain", "request_timeout", "request_failed"}:
+                        result_text = (
+                            "Не удалось однозначно подтвердить создание счёта. Не создавайте новый счёт: "
+                            f"операция могла быть создана у провайдера. Operation ID: {operation_id}. "
+                            "Обратитесь к менеджеру для сверки."
+                        )
+                    else:
+                        result_text = messages.get(error, f"Не удалось создать ссылку на оплату ({error}).")
+            elif action_name == "reset_devices":
                 username = params.get("subscription_username")
                 owned = await self.user_info.find_own_subscription(user_id, username=username)
                 if not owned:
@@ -1801,10 +1850,10 @@ class SupportBot:
             result_text = "❌ Произошла ошибка при выполнении. Обратитесь к менеджеру."
 
         try:
-            await query.edit_message_text(result_text)
+            await query.edit_message_text(result_text, reply_markup=result_markup)
         except Exception:
             try:
-                await query.message.reply_text(result_text)
+                await query.message.reply_text(result_text, reply_markup=result_markup)
             except Exception:
                 pass
         if chat_id:

@@ -26,8 +26,19 @@ logger = logging.getLogger(__name__)
 _TRUE_VALUES = ("1", "true", "yes", "y", "on")
 _SUPPORTED_CHANNELS = ("none", "support_api", "remnawave")
 _TOOL_CHANNELS = ("support_api", "remnawave")
+_PAYMENT_TOOLS = {"get_payment_methods", "create_payment", "check_payment"}
 
 INTEGRATION_TOOL_META = {
+    "get_payment_methods": {
+        "label": "Способы оплаты",
+        "description": "AI может получить включённые способы оплаты, валюту и допустимые суммы.",
+        "destructive": False,
+    },
+    "create_payment": {
+        "label": "Создание ссылки на оплату",
+        "description": "AI может подготовить счёт на пополнение. Ссылка создаётся только после подтверждения клиента.",
+        "destructive": True,
+    },
     "check_payment": {
         "label": "Проверка платежа",
         "description": "AI может уточнять статус платежа по transaction_id/order_id.",
@@ -66,10 +77,16 @@ INTEGRATION_CONTEXT_DEFAULTS = {
     "provide_manager_card": True,
 }
 INTEGRATION_FEATURE_DEFAULTS = {
+    "payments": True,
     "subscription_profile": True,
     "subscription_url": True,
 }
 INTEGRATION_FEATURE_META = {
+    "payments": {
+        "label": "Платежи",
+        "description": "Разрешить AI показывать способы оплаты, создавать ссылки на пополнение и проверять платежи.",
+        "channels": ["support_api"],
+    },
     "subscription_profile": {
         "label": "Профиль подписки",
         "description": "Short ID, трафик, лимиты и технические данные подписки Remnawave.",
@@ -83,6 +100,8 @@ INTEGRATION_FEATURE_META = {
 }
 INTEGRATION_CHANNEL_TOOL_SUPPORT = {
     "support_api": {
+        "get_payment_methods",
+        "create_payment",
         "check_payment",
         "get_subscription_info",
         "get_subscription_devices",
@@ -227,6 +246,7 @@ class UserInfoService:
             "integration_active_channel",
             "integration_provide_ai_context",
             "integration_provide_manager_card",
+            "integration_feature_payments",
             "integration_feature_subscription_profile",
             "integration_feature_subscription_url",
             "support_api_enabled",
@@ -324,6 +344,8 @@ class UserInfoService:
 
     def tool_enabled(self, name: str, channel: Optional[str] = None) -> bool:
         channel = self._normalize_channel(channel or self.active_channel)
+        if channel == "support_api" and name in _PAYMENT_TOOLS and not self.feature_enabled("payments"):
+            return False
         if channel == "remnawave" and name == "get_subscription_info" and not self.feature_enabled("subscription_profile"):
             return False
         return (
@@ -371,36 +393,56 @@ class UserInfoService:
             auth_type=self.remnawave_auth_type,
         )
 
-    async def _support_api_post(self, path: str, payload: Dict) -> Optional[Dict]:
+    async def _support_api_request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict] = None,
+        params: Optional[Dict] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict]:
         await self._refresh_settings()
         if not self.is_configured("support_api"):
             return None
         url = f"{self.support_api_url}{path}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.support_api_token}",
+        }
+        headers.update(extra_headers or {})
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
+                resp = await client.request(
+                    method,
                     url,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.support_api_token}",
-                    },
-                    json=payload,
+                    headers=headers,
+                    json=payload if method.upper() != "GET" else None,
+                    params=params,
                     timeout=15.0,
                 )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"ok": False, "error": "invalid_response"}
+            if not isinstance(data, dict):
+                data = {"ok": False, "error": "invalid_response"}
+            data.setdefault("http_status", resp.status_code)
             if resp.status_code != 200:
-                logger.warning(f"Support API: HTTP {resp.status_code} для {path}")
-                return None
-            data = resp.json()
+                logger.warning(f"Support API: HTTP {resp.status_code} для {path}: {data.get('error')}")
+                return data
             if not data.get("ok"):
                 logger.info(f"Support API {path} error: {data.get('error')}")
                 return data if data.get("error") else None
             return data
         except httpx.TimeoutException:
             logger.warning(f"Support API: таймаут для {path}")
-            return None
+            return {"ok": False, "error": "request_timeout"}
         except Exception as e:
             logger.warning(f"Support API: ошибка запроса {path}: {e}")
-            return None
+            return {"ok": False, "error": "request_failed"}
+
+    async def _support_api_post(self, path: str, payload: Dict) -> Optional[Dict]:
+        return await self._support_api_request("POST", path, payload=payload)
 
     def _prune_cache(self):
         if len(self._user_cache) <= 2000:
@@ -632,13 +674,50 @@ class UserInfoService:
             return None
         return self.format_for_ai(data)
 
+    async def get_payment_methods(self) -> Optional[Dict]:
+        await self._refresh_settings()
+        if self.active_channel != "support_api" or not self.tool_enabled("get_payment_methods", "support_api"):
+            return None
+        return await self._support_api_request("GET", "/api/support/payment/methods")
+
+    async def create_payment_link(
+        self,
+        owner_telegram_id: int,
+        method: str,
+        amount: int,
+        idempotency_key: str,
+    ) -> Optional[Dict]:
+        await self._refresh_settings()
+        if self.active_channel != "support_api" or not self.tool_enabled("create_payment", "support_api"):
+            return None
+        try:
+            amount_value = int(amount)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid_amount"}
+        if amount_value < 50 or amount_value > 9999:
+            return {"ok": False, "error": "invalid_amount"}
+        return await self._support_api_request(
+            "POST",
+            "/api/support/payment/create",
+            payload={
+                "user_id": int(owner_telegram_id),
+                "method": str(method or "").strip(),
+                "amount": amount_value,
+            },
+            extra_headers={"Idempotency-Key": str(idempotency_key)},
+        )
+
     async def check_payment(self, transaction_id: str, owner_telegram_id: int) -> Optional[Dict]:
         await self._refresh_settings()
         if self.active_channel != "support_api" or not self.tool_enabled("check_payment", "support_api"):
             return None
-        data = await self._support_api_post("/api/support/payment/check", {"transaction_id": transaction_id})
+        data = await self._support_api_request(
+            "GET",
+            "/api/support/payment/check",
+            params={"transaction_id": transaction_id},
+        )
         if not data or not data.get("ok"):
-            return None
+            return data
         owner = (data.get("user") or {}).get("telegram_id")
         if owner is not None and int(owner) != int(owner_telegram_id):
             logger.warning(
