@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _TRUE_VALUES = ("1", "true", "yes", "y", "on")
 _SUPPORTED_CHANNELS = ("none", "support_api", "remnawave")
 _TOOL_CHANNELS = ("support_api", "remnawave")
+_PAYMENT_TOOLS = {"get_payment_methods", "create_payment", "check_payment"}
 
 INTEGRATION_TOOL_META = {
     "get_payment_methods": {
@@ -76,10 +77,16 @@ INTEGRATION_CONTEXT_DEFAULTS = {
     "provide_manager_card": True,
 }
 INTEGRATION_FEATURE_DEFAULTS = {
+    "payments": True,
     "subscription_profile": True,
     "subscription_url": True,
 }
 INTEGRATION_FEATURE_META = {
+    "payments": {
+        "label": "Платежи",
+        "description": "Разрешить AI показывать способы оплаты, создавать ссылки на пополнение и проверять платежи.",
+        "channels": ["support_api"],
+    },
     "subscription_profile": {
         "label": "Профиль подписки",
         "description": "Short ID, трафик, лимиты и технические данные подписки Remnawave.",
@@ -239,6 +246,7 @@ class UserInfoService:
             "integration_active_channel",
             "integration_provide_ai_context",
             "integration_provide_manager_card",
+            "integration_feature_payments",
             "integration_feature_subscription_profile",
             "integration_feature_subscription_url",
             "support_api_enabled",
@@ -336,6 +344,8 @@ class UserInfoService:
 
     def tool_enabled(self, name: str, channel: Optional[str] = None) -> bool:
         channel = self._normalize_channel(channel or self.active_channel)
+        if channel == "support_api" and name in _PAYMENT_TOOLS and not self.feature_enabled("payments"):
+            return False
         if channel == "remnawave" and name == "get_subscription_info" and not self.feature_enabled("subscription_profile"):
             return False
         return (

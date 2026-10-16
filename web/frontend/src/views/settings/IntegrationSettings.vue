@@ -251,6 +251,17 @@
             <Tag :severity="form.active_channel === 'support_api' ? 'success' : 'secondary'" :value="form.active_channel === 'support_api' ? 'Активен' : 'Ожидает'" />
           </div>
 
+          <div style="display:flex; flex-direction:column; gap:10px; margin-bottom: 14px;">
+            <label v-for="featureName in featuresForChannel('support_api')" :key="featureName" class="toggle-row">
+              <div>
+                <div style="font-weight:600;">{{ featureMeta[featureName]?.label || featureName }}</div>
+                <div class="muted" style="font-size:12px;">{{ featureMeta[featureName]?.description }}</div>
+              </div>
+              <InputSwitch v-model="form.permissions.features[featureName]" />
+            </label>
+          </div>
+
+          <div style="font-weight: 600; margin-bottom: 10px;">AI tools Support API</div>
           <div class="tools-list">
             <div v-for="tool in toolsForChannel('support_api')" :key="'support-' + tool.name" class="tool-row">
               <div style="min-width:0;">
@@ -260,7 +271,10 @@
                 </div>
                 <div class="muted" style="font-size:12px; margin-top:4px;">{{ tool.description }}</div>
               </div>
-              <InputSwitch v-model="form.permissions.tools.support_api[tool.name]" />
+              <InputSwitch
+                v-model="form.permissions.tools.support_api[tool.name]"
+                :disabled="isPaymentTool(tool.name) && !form.permissions.features.payments"
+              />
             </div>
           </div>
         </div>
@@ -422,6 +436,7 @@ const form = ref({
   },
   permissions: {
     features: {
+      payments: true,
       subscription_profile: true,
       subscription_url: true
     },
@@ -469,8 +484,12 @@ function toolsForChannel(channel: string) {
   return toolMeta.value.filter((tool) => isToolSupportedForChannel(channel, tool.name))
 }
 
+function isPaymentTool(name: string) {
+  return ['get_payment_methods', 'create_payment', 'check_payment'].includes(name)
+}
+
 function featuresForChannel(channel: string) {
-  const order = ['subscription_url', 'subscription_profile']
+  const order = ['payments', 'subscription_url', 'subscription_profile']
   return Object.entries(featureMeta.value)
     .filter(([, meta]) => Array.isArray(meta.channels) && meta.channels.includes(channel))
     .map(([name]) => name)
@@ -525,6 +544,7 @@ async function load() {
   const loadedFeatures = data.permissions?.features || {}
   form.value.permissions = {
     features: {
+      payments: loadedFeatures.payments !== false,
       subscription_profile: loadedFeatures.subscription_profile ?? (data.permissions?.subscription_profile !== false),
       subscription_url: loadedFeatures.subscription_url ?? (data.permissions?.subscription_url !== false)
     },

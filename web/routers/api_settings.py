@@ -484,6 +484,7 @@ _INTEGRATION_KEYS = [
     "integration_active_channel",
     "integration_provide_ai_context",
     "integration_provide_manager_card",
+    "integration_feature_payments",
     "integration_feature_subscription_profile",
     "integration_feature_subscription_url",
 ] + [f"integration_tool_{name}" for name in INTEGRATION_TOOL_META.keys()] + [
