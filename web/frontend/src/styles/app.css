@@ -648,6 +648,16 @@ body.dark .bubble {
   background: rgba(56, 189, 248, 0.08);
 }
 
+.bubble.ai-tool {
+  margin-left: 0;
+  max-width: 680px;
+  border-color: rgba(245, 158, 11, 0.42);
+  border-left-width: 3px;
+  background: rgba(245, 158, 11, 0.08);
+  box-shadow: none;
+  font-size: 0.9em;
+}
+
 .bubble.system {
   margin-left: auto;
   margin-right: auto;

@@ -348,6 +348,7 @@ class AISupport:
         image_data_url: Optional[str] = None,
         execute_tools: bool = False,
         user_info_service=None,
+        tool_event_callback=None,
     ) -> Optional[Union[str, PendingAction]]:
         """Получить ответ от AI с поддержкой нескольких провайдеров.
 
@@ -391,6 +392,7 @@ class AISupport:
                     image_data_url=image_data_url,
                     execute_tools=tools_allowed,
                     user_info_service=user_info_service,
+                    tool_event_callback=tool_event_callback,
                 )
                 if result:
                     return result
@@ -402,6 +404,15 @@ class AISupport:
         if last_error:
             logger.error(f"Все AI провайдеры вернули ошибку. Последняя: {last_error}")
         return None
+
+    @staticmethod
+    async def _emit_tool_event(callback, event: Dict):
+        if not callback:
+            return
+        try:
+            await callback(event)
+        except Exception as e:
+            logger.warning(f"AI tool audit event failed: {e}")
 
     @staticmethod
     def _resolve_payment_method(requested: str, methods: List[Dict]) -> Optional[Dict]:
@@ -610,6 +621,7 @@ class AISupport:
         image_data_url: Optional[str] = None,
         execute_tools: bool = False,
         user_info_service=None,
+        tool_event_callback=None,
     ) -> Optional[Union[str, PendingAction]]:
         """Попытка запроса к конкретному провайдеру с поддержкой нескольких ключей"""
         url = provider.base_url or "https://api.openai.com/v1"
@@ -778,7 +790,37 @@ class AISupport:
                                 args = json.loads(fn.get("arguments") or "{}")
                             except Exception:
                                 args = {}
+                            await self._emit_tool_event(
+                                tool_event_callback,
+                                {
+                                    "phase": "requested",
+                                    "tool": name,
+                                    "args": args,
+                                    "provider": provider.name,
+                                    "model": provider.model_name,
+                                },
+                            )
                             kind, payload_result = await self._execute_tool_call(name, args, owner_telegram_id, user_info_service)
+                            event_result = (
+                                {
+                                    "action": payload_result.action,
+                                    "params": payload_result.params,
+                                    "confirm_text": payload_result.confirm_text,
+                                }
+                                if isinstance(payload_result, PendingAction)
+                                else payload_result
+                            )
+                            await self._emit_tool_event(
+                                tool_event_callback,
+                                {
+                                    "phase": "pending" if kind == "pending_action" else "result",
+                                    "tool": name,
+                                    "kind": kind,
+                                    "result": event_result,
+                                    "provider": provider.name,
+                                    "model": provider.model_name,
+                                },
+                            )
                             if kind == "pending_action":
                                 # Разрушающее действие подтверждено по владению — не выполняем,
                                 # возвращаем сразу, дальнейшая генерация текста не нужна
@@ -805,7 +847,39 @@ class AISupport:
                     if execute_tools and not image_data_url and user_info_service:
                         owner_telegram_id = (context or {}).get("user_id")
                         name, args = text_tool_call
+                        await self._emit_tool_event(
+                            tool_event_callback,
+                            {
+                                "phase": "requested",
+                                "tool": name,
+                                "args": args,
+                                "provider": provider.name,
+                                "model": provider.model_name,
+                                "transport": "text_fallback",
+                            },
+                        )
                         kind, payload_result = await self._execute_tool_call(name, args, owner_telegram_id, user_info_service)
+                        event_result = (
+                            {
+                                "action": payload_result.action,
+                                "params": payload_result.params,
+                                "confirm_text": payload_result.confirm_text,
+                            }
+                            if isinstance(payload_result, PendingAction)
+                            else payload_result
+                        )
+                        await self._emit_tool_event(
+                            tool_event_callback,
+                            {
+                                "phase": "pending" if kind == "pending_action" else "result",
+                                "tool": name,
+                                "kind": kind,
+                                "result": event_result,
+                                "provider": provider.name,
+                                "model": provider.model_name,
+                                "transport": "text_fallback",
+                            },
+                        )
                         if kind == "pending_action":
                             return payload_result
                     return None

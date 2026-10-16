@@ -602,6 +602,7 @@ async def ai_suggest_reply(chat_id: int, request: Request, user: AdminUser = Dep
     history = [
         {"role": "user" if m.message_type == "user" else "assistant", "message": getattr(m, "text", None) or m.content}
         for m in messages
+        if (getattr(m, "source", None) or "") != "ai_tool"
     ]
     ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
     try:
