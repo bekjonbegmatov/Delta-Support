@@ -26,6 +26,7 @@ from modules.config import Config
 from modules.database import Database, Message, SystemConfig
 from modules.ai_support import AISupport
 from modules.user_info import UserInfoService, PendingAction
+from modules.telegram_streaming import TelegramDraft
 
 
 class SupportBot:
@@ -112,6 +113,16 @@ class SupportBot:
             self._md_to_html = _md_to_html
         except Exception:
             self._md_to_html = lambda t: html.escape(t or "")
+
+    def _ai_stream_callback(self, update: Update):
+        if not self.application or not update.effective_chat or update.effective_chat.type != "private":
+            return None
+        draft = TelegramDraft(
+            self.application.bot,
+            update.effective_chat.id,
+            getattr(update.effective_message, "message_thread_id", None),
+        )
+        return draft.update
 
     async def _typing_loop(self, chat_id: int, stop_event: asyncio.Event):
         while not stop_event.is_set():
@@ -1283,7 +1294,9 @@ class SupportBot:
         
         typing_stop, typing_task = self._start_typing(update.effective_chat.id if update.effective_chat else user_id)
         try:
-            ai_response = await self.ai.get_ai_answer(message_text, context, chat_history)
+            ai_response = await self.ai.get_ai_answer(
+                message_text, context, chat_history, stream_callback=self._ai_stream_callback(update),
+            )
         finally:
             await self._stop_typing(typing_stop, typing_task)
         
@@ -3048,6 +3061,7 @@ class SupportBot:
                     question_text, context_info, chat_history, image_data_url=image_data_url,
                     execute_tools=True, user_info_service=self.user_info,
                     tool_event_callback=tool_event_callback,
+                    stream_callback=self._ai_stream_callback(update),
                 )
             finally:
                 await self._stop_typing(typing_stop, typing_task)

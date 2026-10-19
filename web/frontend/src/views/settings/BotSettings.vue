@@ -111,6 +111,23 @@
             </div>
           </div>
 
+          <fieldset class="field full-width" style="border:1px solid var(--app-border); border-radius:var(--app-radius); padding:12px; gap:10px;">
+            <legend style="font-weight:600;">Тип ответа AI</legend>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+              <input type="radio" name="ai_response_mode" value="standard" v-model="form.ai_response_mode" />
+              Обычный — готовый ответ одним сообщением
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+              <input type="radio" name="ai_response_mode" value="streaming" v-model="form.ai_response_mode" />
+              Потоковый — текст появляется по мере генерации
+            </label>
+            <div class="muted" style="font-size:12px;">
+              В личном чате Telegram ответ постепенно появляется, затем сохраняется целиком.
+              Если AI-провайдер или Telegram не поддерживает потоковый ответ, придёт обычное сообщение.
+              Вызовы инструментов и служебные данные клиенту не показываются.
+            </div>
+          </fieldset>
+
           <div class="field full-width">
             <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom: 8px;">
               <label class="muted label-small">Системный промпт (Инструкция для AI)</label>
@@ -158,6 +175,7 @@ const form = ref({
   bot_welcome_message: '',
   ai_system_prompt: '',
   ai_support_enabled: true,
+  ai_response_mode: 'standard',
   manager_reply_prefix: '👨‍💼 Менеджер поддержки',
   manager_reply_style: 'combined',
   client_ack_enabled: true
