@@ -300,6 +300,7 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
         "bot_welcome_message",
         "ai_system_prompt",
         "ai_support_enabled",
+        "ai_response_mode",
         "ai_support_api_type",
         "ai_support_api_key",
         "ai_support_api_keys",
@@ -346,6 +347,7 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
             "{service_context}"
         ),
         "ai_support_enabled": bool(cfg.ai_support_enabled),
+        "ai_response_mode": "standard",
         "ai_support_api_type": cfg.ai_support_api_type or "groq",
         "ai_support_api_key": "",
         "ai_support_api_keys": "",
@@ -360,6 +362,8 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
         if k in ["ai_system_prompt", "bot_welcome_message", "manager_reply_prefix"] and raw is not None and str(raw).strip() == "":
             raw = None
         if k == "manager_reply_style" and raw not in ("combined", "session_header"):
+            raw = None
+        if k == "ai_response_mode" and raw not in ("standard", "streaming"):
             raw = None
         if k in ("ai_support_enabled", "client_ack_enabled"):
             if raw is None:
@@ -402,6 +406,8 @@ async def get_bot_settings(user: AdminUser = Depends(get_current_user)):
 async def put_bot_settings(request: Request, user: AdminUser = Depends(get_current_user)):
     _require_admin(user)
     body = await request.json()
+    if body.get("ai_response_mode") not in (None, "standard", "streaming"):
+        raise HTTPException(status_code=400, detail="ai_response_mode must be 'standard' or 'streaming'")
     allowed = {
         "project_name": "Проект: название",
         "project_description": "Проект: описание",
@@ -411,6 +417,7 @@ async def put_bot_settings(request: Request, user: AdminUser = Depends(get_curre
         "bot_welcome_message": "Бот: приветственное сообщение",
         "ai_system_prompt": "AI: system prompt",
         "ai_support_enabled": "AI: enabled",
+        "ai_response_mode": "AI: режим ответа клиенту",
         "ai_support_api_type": "AI: API type",
         "groq_models": "AI: модели Groq",
         "manager_reply_prefix": "Бот: текст перед сообщением менеджера",

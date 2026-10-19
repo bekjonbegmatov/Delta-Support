@@ -10,11 +10,15 @@ import json
 import re
 import time
 import httpx
+from html import unescape
 from uuid import uuid4
 from typing import Optional, Dict, List, Union
 from modules.config import Config
 from modules.database import KnowledgeBaseEntry, SystemConfig, AIProvider
 from modules.user_info import PendingAction
+from modules.ai_streaming import (
+    TOOL_PROTOCOL, StreamingUnsupported, clean_response_text, emit_preview, read_chat_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +182,8 @@ class AISupport:
     def __init__(self, config: Config):
         self.config = config
         self.enabled = config.ai_support_enabled
+        self.response_mode = "standard"
+        self._stream_unsupported_until = {}
         
         self._runtime_settings_ts = 0.0
         self._runtime_settings = {}
@@ -222,6 +228,7 @@ class AISupport:
             "project_owner_contacts",
             "ai_system_prompt",
             "ai_support_enabled",
+            "ai_response_mode",
             "service_faq",
             "service_tariffs",
             "service_instructions",
@@ -233,6 +240,7 @@ class AISupport:
             rows = await SystemConfig.filter(key__in=keys).all()
             values = {r.key: (r.value or "") for r in rows}
             self._runtime_settings = values
+            self.response_mode = "streaming" if values.get("ai_response_mode") == "streaming" else "standard"
             
             self._project_name = (values.get("project_name") or self.config.project_name or "DELTA-Support").strip()
             self._project_description = (values.get("project_description") or self.config.project_description or "").strip()
@@ -349,6 +357,7 @@ class AISupport:
         execute_tools: bool = False,
         user_info_service=None,
         tool_event_callback=None,
+        stream_callback=None,
     ) -> Optional[Union[str, PendingAction]]:
         """Получить ответ от AI с поддержкой нескольких провайдеров.
 
@@ -359,6 +368,8 @@ class AISupport:
         Разрушающие действия не выполняются напрямую — возвращается PendingAction,
         которое ждёт подтверждения клиента кнопкой в Telegram."""
         await self._refresh_runtime_settings()
+        if self.response_mode != "streaming":
+            stream_callback = None
 
         if not self.enabled:
             return None
@@ -393,10 +404,13 @@ class AISupport:
                     execute_tools=tools_allowed,
                     user_info_service=user_info_service,
                     tool_event_callback=tool_event_callback,
+                    stream_callback=stream_callback,
                 )
                 if result:
                     return result
+                await emit_preview(stream_callback, "")
             except Exception as e:
+                await emit_preview(stream_callback, "")
                 logger.warning(f"Провайдер {provider.name} ({provider.model_name}) ошибка: {e}")
                 last_error = e
                 continue
@@ -416,32 +430,81 @@ class AISupport:
 
     @staticmethod
     def _resolve_payment_method(requested: str, methods: List[Dict]) -> Optional[Dict]:
+        """Resolve a human payment-method label to the API method returned at runtime.
+
+        Models often repeat the user-facing label with extra details, for example
+        ``Банковская карта (МИР)`` while the API title is just ``Банковская карта``.
+        Keep the final choice constrained to the current API response instead of
+        trusting a model-generated code.
+        """
         if not methods:
             return None
-        query = str(requested or "").strip().casefold()
+
+        def normalize(value) -> str:
+            value = str(value or "").casefold().replace("ё", "е")
+            return " ".join(re.findall(r"[a-zа-я0-9]+", value))
+
+        query = normalize(requested)
         if not query:
             return methods[0] if len(methods) == 1 else None
-        aliases = {
-            "сбп": "platega_sbp",
-            "sbp": "platega_sbp",
-            "карта": "platega_card",
-            "картой": "platega_card",
-            "card": "platega_card",
-            "крипта": "platega_crypto",
-            "криптовалюта": "platega_crypto",
-            "crypto": "platega_crypto",
-            "cryptobot": "cryptobot",
-            "stars": "tgs",
-            "звезды": "tgs",
-            "звёзды": "tgs",
-            "tgs": "tgs",
-        }
-        query = aliases.get(query, query)
+
+        # Prefer an exact code/title before applying fuzzy human-label matching.
         for method in methods:
-            code = str(method.get("code") or "").casefold()
-            title = str(method.get("title") or "").casefold()
-            if query == code or query == title or query in title:
+            code = normalize(method.get("code"))
+            title = normalize(method.get("title"))
+            if query == code or query == title:
                 return method
+
+        # Aliases list possible provider codes in priority order. Only a code that
+        # is actually present in ``methods`` can be selected.
+        alias_codes = {
+            "сбп": ("platega_sbp", "sbp"),
+            "sbp": ("platega_sbp", "sbp"),
+            "карта": ("platega_card", "card"),
+            "картой": ("platega_card", "card"),
+            "банковская карта": ("platega_card", "card"),
+            "банковская карта мир": ("platega_card", "card"),
+            "мир": ("platega_card", "card"),
+            "card": ("platega_card", "card"),
+            "крипта": ("cryptobot", "platega_crypto"),
+            "криптовалюта": ("cryptobot", "platega_crypto"),
+            "crypto": ("cryptobot", "platega_crypto"),
+            "крипто бот": ("cryptobot", "platega_crypto"),
+            "cryptobot": ("cryptobot", "platega_crypto"),
+            "stars": ("tgs",),
+            "звезды": ("tgs",),
+            "tgs": ("tgs",),
+        }
+        requested_codes = alias_codes.get(query, ())
+        if requested_codes:
+            by_code = {normalize(method.get("code")): method for method in methods}
+            for requested_code in requested_codes:
+                match = by_code.get(normalize(requested_code))
+                if match:
+                    return match
+
+        # Accept harmless qualifiers added by the model, and use descriptions for
+        # labels such as "карта МИР". Select only a unique best match.
+        query_tokens = set(query.split())
+        scored = []
+        for method in methods:
+            title = normalize(method.get("title"))
+            description = normalize(method.get("description"))
+            searchable = " ".join(part for part in (title, description) if part)
+            searchable_tokens = set(searchable.split())
+            score = 0
+            if len(title) >= 3 and (title in query or query in title):
+                score = 80 + min(len(set(title.split()) & query_tokens), 10)
+            elif len(query_tokens) >= 2 and query_tokens.issubset(searchable_tokens):
+                score = 60 + len(query_tokens)
+            elif len(query_tokens & searchable_tokens) >= 2:
+                score = 40 + len(query_tokens & searchable_tokens)
+            if score:
+                scored.append((score, method))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            if len(scored) == 1 or scored[0][0] > scored[1][0]:
+                return scored[0][1]
         return None
 
     async def _execute_tool_call(self, name: str, args: Dict, owner_telegram_id: int, user_info_service):
@@ -591,26 +654,70 @@ class AISupport:
             return ("result", {"ok": False, "error": "внутренняя ошибка"})
 
     def _extract_text_tool_call(self, content: str) -> Optional[tuple[str, Dict]]:
+        """Parse tool calls emitted as text by partially compatible providers.
+
+        Besides the common ``functions.name {json}`` fallback, DeepSeek can emit
+        DSML tags in ``message.content`` even when OpenAI-compatible tools were
+        requested. These tags must be executed as tools, never shown to clients.
+        """
         text = content or ""
         marker = re.search(r"(?:^|\s)(?:To\s*=\s*)?functions\.([a-zA-Z0-9_]+)", text)
-        if not marker:
+        name = ""
+        args = None
+        if marker:
+            name = marker.group(1)
+            json_start = text.find("{", marker.end())
+            if json_start >= 0:
+                try:
+                    args, _ = json.JSONDecoder().raw_decode(text[json_start:])
+                except Exception:
+                    args = None
+
+        if args is None:
+            # DeepSeek DSML uses full-width vertical bars. Normalise only markup
+            # characters; parameter values are kept intact.
+            dsml = text.replace("｜", "|").replace("＜", "<").replace("＞", ">")
+            invoke = re.search(
+                r'<\|\|DSML\|\|\s+invoke\s+name=["\']([a-zA-Z0-9_]+)["\']\s*>(.*?)'
+                r'</\|\|DSML\|\|\s+invoke\s*>',
+                dsml,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if invoke:
+                name = invoke.group(1)
+                args = {}
+                param_pattern = re.compile(
+                    r'<\|\|DSML\|\|\s+parameter\s+name=["\']([^"\']+)["\']'
+                    r'(?:\s+string=["\'](true|false)["\'])?\s*>(.*?)'
+                    r'</\|\|DSML\|\|\s+parameter\s*>',
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                for param in param_pattern.finditer(invoke.group(2)):
+                    key = param.group(1).strip()
+                    raw_value = unescape(param.group(3).strip())
+                    if (param.group(2) or "").casefold() == "true":
+                        value = raw_value
+                    else:
+                        try:
+                            value = json.loads(raw_value)
+                        except Exception:
+                            value = raw_value
+                    args[key] = value
+
+        if not name or not isinstance(args, dict):
             return None
-        name = _TEXT_TOOL_ALIASES.get(marker.group(1), marker.group(1))
-        json_start = text.find("{", marker.end())
-        if json_start < 0:
-            return None
-        try:
-            args, _ = json.JSONDecoder().raw_decode(text[json_start:])
-        except Exception:
-            return None
-        if not isinstance(args, dict):
-            return None
+        name = _TEXT_TOOL_ALIASES.get(name, name)
         if "subscription_username" not in args:
             for key in ("username", "subscription", "subscription_name", "short_id"):
                 if args.get(key):
                     args["subscription_username"] = args[key]
                     break
         return name, args
+
+    @staticmethod
+    def _contains_tool_protocol(content: str) -> bool:
+        """Return True for leaked provider/tool protocol that is unsafe to display."""
+        return bool(TOOL_PROTOCOL.search(content or ""))
 
     async def _try_provider_request(
         self,
@@ -622,6 +729,7 @@ class AISupport:
         execute_tools: bool = False,
         user_info_service=None,
         tool_event_callback=None,
+        stream_callback=None,
     ) -> Optional[Union[str, PendingAction]]:
         """Попытка запроса к конкретному провайдеру с поддержкой нескольких ключей"""
         url = provider.base_url or "https://api.openai.com/v1"
@@ -775,7 +883,7 @@ class AISupport:
 
         try:
             async with httpx.AsyncClient() as client:
-                response = await self._post_chat_completion(client, url, headers, payload)
+                response = await self._request_chat_completion(client, url, headers, payload, stream_callback)
 
                 if execute_tools and not image_data_url and allowed_tools:
                     message = response["choices"][0]["message"]
@@ -835,13 +943,13 @@ class AISupport:
                         follow_up = {**payload, "messages": messages}
                         follow_up.pop("tools", None)
                         follow_up.pop("tool_choice", None)
-                        response = await self._post_chat_completion(client, url, headers, follow_up)
+                        response = await self._request_chat_completion(client, url, headers, follow_up, stream_callback)
 
                 data = response
                 content = data["choices"][0]["message"]["content"]
                 if content:
                     # Страховка: убираем reasoning-блоки <think>...</think>
-                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    content = clean_response_text(content)
                 text_tool_call = self._extract_text_tool_call(content or "")
                 if text_tool_call:
                     if execute_tools and not image_data_url and user_info_service:
@@ -883,6 +991,16 @@ class AISupport:
                         if kind == "pending_action":
                             return payload_result
                     return None
+                if self._contains_tool_protocol(content or ""):
+                    # Never leak a provider's malformed internal protocol to a
+                    # client. Returning None activates the bot's normal safe
+                    # fallback (and another configured provider may be tried).
+                    logger.warning(
+                        "Suppressed unparseable tool protocol from provider %s (%s)",
+                        provider.name,
+                        provider.model_name,
+                    )
+                    return None
                 if content:
                     return content
                 raise Exception("Empty response from AI")
@@ -893,6 +1011,20 @@ class AISupport:
             raise Exception(f"Connection error: {str(e)[:100]}")
         except Exception as e:
             raise
+
+    async def _request_chat_completion(self, client, url, headers, payload, stream_callback=None):
+        key = (url, payload.get("model"))
+        unsupported = getattr(self, "_stream_unsupported_until", {})
+        if stream_callback and unsupported.get(key, 0) <= time.monotonic():
+            try:
+                return await read_chat_stream(client, url, headers, payload, stream_callback)
+            except StreamingUnsupported:
+                # Retry once without streaming, then remember this model/endpoint
+                # for an hour. Other validation/authentication errors are not retried.
+                unsupported[key] = time.monotonic() + 3600
+                self._stream_unsupported_until = unsupported
+                logger.info("Streaming unsupported for model %s; using a completed reply", payload.get("model"))
+        return await self._post_chat_completion(client, url, headers, payload)
 
     @staticmethod
     async def _post_chat_completion(client: httpx.AsyncClient, url: str, headers: dict, payload: dict) -> dict:
