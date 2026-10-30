@@ -45,6 +45,26 @@ class Chat(Model):
     class Meta:
         table = "chats"
 
+class PaymentOperation(Model):
+    """Durable checkout intent: retries reuse an immutable key and request body."""
+    id = fields.IntField(pk=True)
+    chat = fields.ForeignKeyField('models.Chat', related_name='payment_operations')
+    user_id = fields.BigIntField(index=True)  # Telegram ID, never a local user record ID
+    method = fields.CharField(max_length=100)
+    method_title = fields.CharField(max_length=255)
+    amount = fields.IntField()
+    currency = fields.CharField(max_length=12, default="RUB")
+    idempotency_key = fields.CharField(max_length=36, unique=True, null=True)
+    state = fields.CharField(max_length=30, default="proposed")
+    result = fields.JSONField(null=True)  # Creation snapshot, never current payment status
+    started_at = fields.DatetimeField(null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "payment_operations"
+
+
 class Message(Model):
     """Модель сообщения"""
     id = fields.IntField(pk=True)

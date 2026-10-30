@@ -27,11 +27,13 @@ from modules.config import Config
 from modules.database import Database, Message, SystemConfig
 from modules.ai_support import AISupport
 from modules.ai_policy import should_offer_manager
-from modules.user_info import UserInfoService, PendingAction
+from modules.user_info import UserInfoService, PendingAction, subscription_display_name
+from modules.payment_flow import PaymentFlowMixin
+from modules.database import PaymentOperation
 from modules.telegram_streaming import TelegramDraft
 
 
-class SupportBot:
+class SupportBot(PaymentFlowMixin):
     """Класс бота поддержки"""
 
     _AI_TOOL_LABELS = {
@@ -193,10 +195,14 @@ class SupportBot:
             "confirmation_sent": "Клиенту отправлен запрос подтверждения",
             "confirmed": "Клиент подтвердил действие",
             "cancelled": "Клиент отменил действие",
-            "action_result": "Действие выполнено",
-            "client_message": "AI отправил сообщение клиенту",
+            "action_result": "Результат выполнения действия",
+            "client_message": "Клиенту отправлено сообщение",
             "delivery_failed": "Не удалось отправить сообщение клиенту",
         }
+        if phase == "action_result":
+            backend = (event.get("result") or {}).get("backend")
+            if isinstance(backend, dict):
+                titles[phase] = "Действие выполнено" if backend.get("ok") is True else "Действие завершилось ошибкой"
         lines = [f"AI-инструмент · {titles.get(phase, phase)}", f"Инструмент: {label}"]
         if event.get("provider"):
             provider = str(event.get("provider"))
@@ -335,6 +341,19 @@ class SupportBot:
             return False
         try:
             subscriptions = await self.user_info.get_own_subscriptions(user_id)
+            # An explicitly named subscription scopes the whole device search.
+            selected = [sub for sub in subscriptions if any(
+                code and re.search(r"(?<!\w)" + re.escape(str(code)) + r"(?!\w)", question_text, re.IGNORECASE)
+                for code in (sub.get("username"), sub.get("display_name"))
+            )]
+            if len(selected) > 1:
+                return False
+            if selected:
+                subscriptions = selected
+            elif re.search(r"\bподписк[а-яё]*\s+[«\"']?[\w-]+|\b\d+_[a-z0-9_-]+\b", question_text, re.IGNORECASE):
+                # A named but unknown code (or a tariff used as a name) must not
+                # fall through to a different subscription with a matching device.
+                return False
             candidates = []
             for sub in subscriptions:
                 username = sub.get("username")
@@ -358,8 +377,8 @@ class SupportBot:
             username = best_sub.get("username")
             action = PendingAction(
                 action="delete_device",
-                params={"subscription_username": username, "hwid": self._device_hwid(best_device), "device_label": label},
-                confirm_text=f"Подтвердите удаление устройства «{label}» из подписки «{best_sub.get('tarif') or username}».",
+                params={"subscription_username": username, "subscription_id": best_sub.get("id"), "hwid": self._device_hwid(best_device), "device_label": label},
+                confirm_text=f"Подтвердите удаление устройства «{label}» из подписки «{subscription_display_name(best_sub)}».",
             )
             await self._record_ai_tool_event(
                 chat,
@@ -1056,6 +1075,12 @@ class SupportBot:
                 await query.edit_message_text("❌ Вы не можете запросить менеджера для этого чата.")
             return
 
+        if data.startswith("payment_"):
+            match = re.fullmatch(r"payment_(confirm|retry|check|cancel)_(\d+)", data)
+            if match:
+                await self._handle_payment_callback(query, user_id, match.group(1), int(match.group(2)))
+            return
+
         # Подтверждение/отмена разрушающих действий (сброс устройств, перевыпуск подписки)
         # доступно клиенту напрямую, без прав персонала — это его собственный аккаунт
         if data.startswith("confirm_action_"):
@@ -1297,6 +1322,7 @@ class SupportBot:
             "last_name": user.last_name
         }
         
+        context["payment_context"] = await self._get_payment_context(chat.id, user_id)
         typing_stop, typing_task = self._start_typing(update.effective_chat.id if update.effective_chat else user_id)
         try:
             ai_response = await self.ai.get_ai_answer(
@@ -1866,6 +1892,9 @@ class SupportBot:
     async def _send_pending_action_confirmation(self, update: Update, chat, action: PendingAction):
         """AI предложило разрушающее действие — просим клиента подтвердить кнопкой,
         реальный вызов Support API происходит только после клика"""
+        if action.action == "create_payment":
+            await self._prepare_payment_confirmation(update, chat, action)
+            return
         import secrets
         token = secrets.token_urlsafe(8)
         self._store_pending_action(token, {
@@ -1914,6 +1943,21 @@ class SupportBot:
                 pass
             return
 
+        if entry.get("action") == "create_payment":
+            params = entry.get("params") or {}
+            previous_key = params.get("idempotency_key")
+            if not previous_key:
+                await query.edit_message_text("Это подтверждение устарело. Запросите новый счёт и подтвердите его создание.")
+                return
+            operation, _ = await PaymentOperation.get_or_create(
+                idempotency_key=previous_key,
+                defaults={"chat_id": entry["chat_id"], "user_id": user_id,
+                    "method": params["method"], "method_title": params.get("method_title") or params["method"],
+                    "amount": params["amount"], "currency": params.get("currency") or "RUB"},
+            )
+            await self._handle_payment_callback(query, user_id, "confirm", operation.id)
+            return
+
         try:
             await query.answer("Выполняю действие…")
         except Exception:
@@ -1940,57 +1984,13 @@ class SupportBot:
         result_markup = None
         audit_result = None
         try:
-            if action_name == "create_payment":
-                operation_id = params.get("idempotency_key")
-                res = await self.user_info.create_payment_link(
-                    owner_telegram_id=user_id,
-                    method=params.get("method"),
-                    amount=params.get("amount"),
-                    idempotency_key=operation_id,
-                )
-                audit_result = res
-                if res and res.get("ok"):
-                    pay_link = str(res.get("pay_link") or "").strip()
-                    order_id = res.get("order_id") or "—"
-                    amount = res.get("amount") or params.get("amount")
-                    currency = res.get("currency") or params.get("currency") or "RUB"
-                    result_text = f"Счёт создан на {amount} {currency}.\nНомер: {order_id}"
-                    if pay_link:
-                        result_text += f"\n\nСсылка для оплаты:\n{pay_link}"
-                        if pay_link.startswith(("https://", "http://")):
-                            result_markup = InlineKeyboardMarkup([[
-                                InlineKeyboardButton("Перейти к оплате", url=pay_link)
-                            ]])
-                else:
-                    error = (res or {}).get("error") or "request_failed"
-                    operation_id = (res or {}).get("operation_id") or operation_id
-                    messages = {
-                        "invalid_token": "Платёжная интеграция временно недоступна: токен Support API отклонён.",
-                        "user_not_found": "Пользователь не найден в платёжной системе.",
-                        "user_blocked": "Пополнение недоступно: пользователь заблокирован.",
-                        "captcha_required": "Сначала необходимо пройти капчу в основном боте.",
-                        "unsupported_method": "Выбранный способ оплаты не поддерживается.",
-                        "method_unavailable": "Выбранный способ оплаты сейчас недоступен.",
-                        "invalid_amount": "Сумма пополнения должна быть от 50 до 9999 рублей.",
-                        "idempotency_conflict": "Параметры этого платёжного намерения изменились. Требуется проверка поддержкой.",
-                        "operation_requires_review": "Операция требует проверки поддержкой.",
-                        "previous_operation_requires_review": "Предыдущая платёжная операция требует проверки поддержкой.",
-                    }
-                    if error in {"checkout_uncertain", "request_timeout", "request_failed"}:
-                        result_text = (
-                            "Не удалось однозначно подтвердить создание счёта. Не создавайте новый счёт: "
-                            f"операция могла быть создана у провайдера. Operation ID: {operation_id}. "
-                            "Обратитесь к менеджеру для сверки."
-                        )
-                    else:
-                        result_text = messages.get(error, f"Не удалось создать ссылку на оплату ({error}).")
-            elif action_name == "reset_devices":
+            if action_name == "reset_devices":
                 username = params.get("subscription_username")
-                owned = await self.user_info.find_own_subscription(user_id, username=username)
+                owned = await self.user_info.find_own_subscription(user_id, username=username, subscription_id=params.get("subscription_id"))
                 if not owned:
                     result_text = "❌ Подписка больше не найдена среди ваших — действие отменено."
                 else:
-                    res = await self.user_info.reset_devices(params.get("short_id") or owned.get("short_id"))
+                    res = await self.user_info.reset_devices(owned.get("short_id"), username=owned.get("username"), subscription_id=owned.get("id"))
                     audit_result = res
                     result_text = (
                         "✅ Все устройства подписки сброшены."
@@ -1999,11 +1999,11 @@ class SupportBot:
                     )
             elif action_name == "revoke_subscription":
                 username = params.get("subscription_username")
-                owned = await self.user_info.find_own_subscription(user_id, username=username)
+                owned = await self.user_info.find_own_subscription(user_id, username=username, subscription_id=params.get("subscription_id"))
                 if not owned:
                     result_text = "❌ Подписка больше не найдена среди ваших — действие отменено."
                 else:
-                    res = await self.user_info.revoke_subscription(username)
+                    res = await self.user_info.revoke_subscription(owned.get("username"), subscription_id=owned.get("id"))
                     audit_result = res
                     if res and res.get("ok"):
                         result_text = "✅ Подписка перевыпущена. Зайдите в личный кабинет за новой ссылкой."
@@ -2015,11 +2015,11 @@ class SupportBot:
             elif action_name == "delete_device":
                 username = params.get("subscription_username")
                 hwid = params.get("hwid")
-                owned = await self.user_info.find_own_subscription(user_id, username=username)
+                owned = await self.user_info.find_own_subscription(user_id, username=username, subscription_id=params.get("subscription_id"))
                 if not owned or not hwid:
                     result_text = "❌ Устройство или подписка больше не найдены — действие отменено."
                 else:
-                    res = await self.user_info.delete_device(username, hwid)
+                    res = await self.user_info.delete_device(owned.get("username"), hwid, subscription_id=owned.get("id"))
                     audit_result = res
                     result_text = "✅ Устройство удалено." if res and res.get("ok") else "❌ Не удалось удалить устройство. Попробуйте позже."
         except Exception as e:
@@ -3177,6 +3177,7 @@ class SupportBot:
                     if msg.id != saved_msg.id and msg.message_type in {"user", "ai", "manager"} and getattr(msg, "source", None) not in {"system", "ai_tool"}
                 ]
                 context_info = {"user_id": user_id, "chat_id": chat.id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
+                context_info["payment_context"] = await self._get_payment_context(chat.id, user_id)
                 # Данные аккаунта клиента из Support API (баланс, подписки, ключи)
                 try:
                     account_info = await self.user_info.get_ai_context(user_id)

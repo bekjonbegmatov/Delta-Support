@@ -15,7 +15,7 @@ from uuid import uuid4
 from typing import Optional, Dict, List, Union
 from modules.config import Config
 from modules.database import KnowledgeBaseEntry, SystemConfig, AIProvider
-from modules.user_info import PendingAction
+from modules.user_info import PendingAction, subscription_display_name
 from modules.openai_api import apply_chat_compatibility, endpoint_url, reasoning_model, request_responses
 from modules.ai_policy import DEFAULT_SUPPORT_PROMPT, SUPPORT_POLICY, OFFER_MANAGER_TOOL, SupportAnswer, validate_manager_offer
 from modules.knowledge_gaps import REPORT_KNOWLEDGE_GAP_TOOL, record_knowledge_gap
@@ -47,7 +47,8 @@ _READONLY_TOOLS = [
             "name": "check_payment",
             "description": (
                 "Проверить статус платежа клиента по ID транзакции, order_id или provider transaction id. "
-                "Используй, когда клиент говорит, что оплатил, но деньги не пришли, или спрашивает статус оплаты."
+                "Используй для актуального статуса оплаты; передавай order_id/transaction_id созданного счёта. "
+                "Снимок ответа создания, открытие ссылки или возврат с платёжной страницы не доказывают оплату."
             ),
             "parameters": {
                 "type": "object",
@@ -64,14 +65,16 @@ _READONLY_TOOLS = [
             "name": "get_subscription_info",
             "description": (
                 "Получить подробную информацию о конкретной подписке клиента: тариф, срок действия, трафик, "
-                "лимит устройств. Используй username подписки из раздела ДАННЫЕ АККАУНТА ПОЛЬЗОВАТЕЛЯ."
+                "лимит устройств. Используй username или локальный id выбранной подписки из ДАННЫХ АККАУНТА. "
+                "Показывай её display_name (fallback username), а тариф — отдельно; Telegram username владельца не подходит."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subscription_username": {"type": "string", "description": "username подписки клиента"}
+                    "subscription_username": {"type": "string", "description": "Уникальный username выбранной подписки, например 46235_41nr3; не тариф и не Telegram username владельца"},
+                    "subscription_id": {"type": "integer", "minimum": 1, "description": "Локальный id выбранной подписки из Support API; укажи username или этот id"}
                 },
-                "required": ["subscription_username"],
+                "required": [],
             },
         },
     },
@@ -83,9 +86,10 @@ _READONLY_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subscription_username": {"type": "string", "description": "username подписки клиента"}
+                    "subscription_username": {"type": "string", "description": "Уникальный username выбранной подписки, например 46235_41nr3; не тариф и не Telegram username владельца"},
+                    "subscription_id": {"type": "integer", "minimum": 1, "description": "Локальный id выбранной подписки из Support API; укажи username или этот id"}
                 },
-                "required": ["subscription_username"],
+                "required": [],
             },
         },
     },
@@ -102,15 +106,23 @@ _DESTRUCTIVE_TOOLS = [
             "description": (
                 "Подготовить ссылку на пополнение баланса клиента. Вызывай только когда клиент явно попросил "
                 "создать счёт и указал сумму. Метод можно передать кодом или названием; если он не указан и "
-                "доступно несколько способов, сначала уточни выбор. Ссылка создаётся только после подтверждения клиента."
+                "доступно несколько способов, сначала уточни выбор. Ссылка создаётся только после подтверждения клиента. "
+                "Не вызывай повторно для исправления таймаута/409/502: повтор той же операции сохраняет прежний ключ. "
+                "Новый счёт возможен только по отдельному явному запросу клиента; старые счета не отменяются. "
+                "При просьбе повторить тот же запрос выбери request_mode=retry и operation_id конкретной операции из контекста счетов. "
+                "Сумма и метод для повтора необязательны: сервер использует сохранённые. Если счетов несколько, уточни выбор, не угадывай. "
+                "при явном запросе нового счёта — new. UUID выдаёт сервер только после отдельного подтверждения нового счёта. "
+                "Для Platega не спрашивай email и не передавай metadata."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "amount": {"type": "integer", "minimum": 50, "maximum": 9999, "description": "Сумма в целых рублях"},
-                    "method": {"type": "string", "description": "Код или название способа оплаты, например platega_sbp или СБП"},
+                    "amount": {"type": "integer", "description": "Для нового счёта обязательна сумма 50–9999 целых рублей; для повтора можно не передавать"},
+                    "method": {"type": "string", "description": "Для нового счёта код или название способа оплаты, например platega_sbp или СБП; для повтора не передавай либо передай исходный код из контекста"},
+                    "request_mode": {"type": "string", "enum": ["new", "retry"], "description": "new — отдельный явно запрошенный новый счёт; retry — повтор прежней операции с тем же ключом и параметрами"},
+                    "operation_id": {"type": "integer", "minimum": 1, "description": "Только для retry: локальный ID конкретной операции из контекста счетов. Это не order_id и не UUID"},
                 },
-                "required": ["amount"],
+                "required": [],
             },
         },
     },
@@ -125,9 +137,10 @@ _DESTRUCTIVE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subscription_username": {"type": "string", "description": "username подписки клиента"}
+                    "subscription_username": {"type": "string", "description": "Уникальный username выбранной подписки, например 46235_41nr3; не тариф и не Telegram username владельца"},
+                    "subscription_id": {"type": "integer", "minimum": 1, "description": "Локальный id выбранной подписки из Support API; укажи username или этот id"}
                 },
-                "required": ["subscription_username"],
+                "required": [],
             },
         },
     },
@@ -136,16 +149,17 @@ _DESTRUCTIVE_TOOLS = [
         "function": {
             "name": "revoke_subscription",
             "description": (
-                "Перевыпустить подписку клиента: создаётся новая ссылка, старые устройства отключаются. "
+                "Перевыпустить ССЫЛКУ подписки клиента, старые устройства отключаются. Это НЕ продление срока подписки. "
                 "Работает только если с даты выдачи подписки прошло больше 20 дней. Используй, только если "
                 "клиент явно просит перевыпустить/обновить ссылку подписки."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subscription_username": {"type": "string", "description": "username подписки клиента"}
+                    "subscription_username": {"type": "string", "description": "Уникальный username выбранной подписки, например 46235_41nr3; не тариф и не Telegram username владельца"},
+                    "subscription_id": {"type": "integer", "minimum": 1, "description": "Локальный id выбранной подписки из Support API; укажи username или этот id"}
                 },
-                "required": ["subscription_username"],
+                "required": [],
             },
         },
     },
@@ -160,10 +174,11 @@ _DESTRUCTIVE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subscription_username": {"type": "string"},
+                    "subscription_username": {"type": "string", "description": "Уникальный username выбранной подписки; не тариф и не Telegram username владельца"},
+                    "subscription_id": {"type": "integer", "minimum": 1, "description": "Локальный id выбранной подписки из Support API; укажи username или этот id"},
                     "hwid": {"type": "string", "description": "hwid устройства из списка get_subscription_devices"},
                 },
-                "required": ["subscription_username", "hwid"],
+                "required": ["hwid"],
             },
         },
     },
@@ -523,8 +538,37 @@ class AISupport:
                 return ("result", data)
 
             if name == "create_payment":
+                request_mode = args.get("request_mode") or "new"
+                if not isinstance(request_mode, str) or request_mode not in {"new", "retry"}:
+                    return ("result", {"ok": False, "error": "invalid_request_mode"})
+                if request_mode == "retry":
+                    # Replaying an existing operation uses its immutable saved
+                    # parameters, regardless of current payment method availability.
+                    # The bot validates operation ownership and rejects ambiguity.
+                    retry_params = {"request_mode": "retry"}
+                    operation_id = args.get("operation_id")
+                    if operation_id is not None:
+                        if isinstance(operation_id, bool) or not isinstance(operation_id, int) or operation_id <= 0:
+                            return ("result", {"ok": False, "error": "invalid_operation_id"})
+                        retry_params["operation_id"] = operation_id
+                    if args.get("amount") is not None:
+                        amount = args["amount"]
+                        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+                            return ("result", {"ok": False, "error": "invalid_amount"})
+                        retry_params["amount"] = amount
+                    if args.get("method") is not None:
+                        if not isinstance(args["method"], str) or not args["method"].strip():
+                            return ("result", {"ok": False, "error": "invalid_method"})
+                        retry_params["method"] = args["method"].strip()
+                    return ("pending_action", PendingAction(
+                        action="create_payment", params=retry_params,
+                        confirm_text="Повторить выбранную платёжную операцию с прежним ключом и сохранёнными параметрами?",
+                    ))
                 try:
-                    amount = int(args.get("amount"))
+                    raw_amount = args.get("amount")
+                    if isinstance(raw_amount, bool) or isinstance(raw_amount, float) and not raw_amount.is_integer():
+                        raise ValueError("Not an integer amount")
+                    amount = int(raw_amount)
                 except (TypeError, ValueError):
                     return ("result", {"ok": False, "error": "invalid_amount", "message": "Укажите сумму целым числом от 50 до 9999 рублей"})
                 if amount < 50 or amount > 9999:
@@ -567,9 +611,9 @@ class AISupport:
                         "method_title": title,
                         "amount": amount,
                         "currency": selected.get("currency") or methods_data.get("currency") or "RUB",
-                        "idempotency_key": str(uuid4()),
+                        "request_mode": request_mode,
                     },
-                    confirm_text=f"Создать ссылку на пополнение на {amount} ₽ через «{title}»?",
+                    confirm_text=f"Создать новый счёт на пополнение на {amount} ₽ через «{title}»?",
                 )
                 return ("pending_action", action)
 
@@ -584,68 +628,63 @@ class AISupport:
                     return ("result", data)
                 return ("result", data)
 
-            if name == "get_subscription_info":
-                username = str(args.get("subscription_username") or "").strip()
-                owned = await user_info_service.find_own_subscription(owner_telegram_id, username=username)
+            if name in {"get_subscription_info", "get_subscription_devices", "reset_devices", "revoke_subscription", "delete_device"}:
+                username_arg = args.get("subscription_username")
+                subscription_id = args.get("subscription_id")
+                if username_arg is not None and not isinstance(username_arg, str):
+                    return ("result", {"ok": False, "error": "invalid_subscription_username"})
+                username = (username_arg or "").strip()
+                if subscription_id is not None and (isinstance(subscription_id, bool) or not isinstance(subscription_id, int) or subscription_id <= 0):
+                    return ("result", {"ok": False, "error": "invalid_subscription_id"})
+                if not username and subscription_id is None:
+                    return ("result", {"ok": False, "error": "subscription_identifier_required", "message": "Выберите подписку по её коду или локальному id; название тарифа не является идентификатором."})
+                selector = {}
+                if username:
+                    selector["username"] = username
+                if subscription_id is not None:
+                    selector["subscription_id"] = subscription_id
+                owned = await user_info_service.find_own_subscription(owner_telegram_id, **selector)
                 if not owned:
-                    return ("result", {"ok": False, "error": "Подписка с таким именем не найдена среди подписок этого клиента"})
-                data = await user_info_service.get_subscription_info(username=username)
-                if not data:
-                    return ("result", {"ok": False, "error": "Не удалось получить данные подписки"})
-                return ("result", data)
-
-            if name == "get_subscription_devices":
-                username = str(args.get("subscription_username") or "").strip()
-                owned = await user_info_service.find_own_subscription(owner_telegram_id, username=username)
-                if not owned:
-                    return ("result", {"ok": False, "error": "Подписка с таким именем не найдена среди подписок этого клиента"})
-                data = await user_info_service.get_subscription_devices(username)
-                if not data:
-                    return ("result", {"ok": False, "error": "Не удалось получить список устройств"})
-                return ("result", data)
-
-            if name == "reset_devices":
-                username = str(args.get("subscription_username") or "").strip()
-                owned = await user_info_service.find_own_subscription(owner_telegram_id, username=username)
-                if not owned:
-                    return ("denied", "Подписка с таким именем не найдена среди подписок этого клиента — действие отклонено.")
-                action = PendingAction(
-                    action="reset_devices",
-                    params={"short_id": owned.get("short_id"), "subscription_username": username},
-                    confirm_text=(
-                        f"⚠️ Точно сбросить ВСЕ устройства подписки «{owned.get('tarif', username)}»? "
+                    return ("denied", "Выбранная подписка не найдена среди подписок этого клиента — действие отклонено. Уточните код подписки.")
+                # Trust only the selected account record. Never derive identity from
+                # the tariff title, owner Telegram username, or model-generated IDs.
+                username = str(owned.get("username") or "").strip() or None
+                owned_id = owned.get("id")
+                selector = {}
+                if username:
+                    selector["username"] = username
+                if owned_id is not None:
+                    selector["subscription_id"] = owned_id
+                if not selector:
+                    return ("denied", "В данных подписки нет username или id для безопасного выполнения операции.")
+                label = subscription_display_name(owned)
+                if not username and not owned.get("display_name") and owned_id is not None:
+                    label = f"Подписка ID {owned_id} (код отсутствует)"
+                if name == "get_subscription_info":
+                    data = await user_info_service.get_subscription_info(**selector)
+                    return ("result", data or {"ok": False, "error": "Не удалось получить данные подписки"})
+                if name == "get_subscription_devices":
+                    data = await user_info_service.get_subscription_devices(**selector)
+                    return ("result", data or {"ok": False, "error": "Не удалось получить список устройств"})
+                action_params = {"subscription_username": username, "subscription_id": owned_id}
+                if name == "reset_devices":
+                    action_params["short_id"] = owned.get("short_id")
+                    confirm_text = (
+                        f"⚠️ Точно сбросить ВСЕ устройства подписки «{label}»? "
                         "Все подключённые устройства отключатся, их нужно будет подключить заново."
-                    ),
-                )
-                return ("pending_action", action)
-
-            if name == "revoke_subscription":
-                username = str(args.get("subscription_username") or "").strip()
-                owned = await user_info_service.find_own_subscription(owner_telegram_id, username=username)
-                if not owned:
-                    return ("denied", "Подписка с таким именем не найдена среди подписок этого клиента — действие отклонено.")
-                action = PendingAction(
-                    action="revoke_subscription",
-                    params={"subscription_username": username},
-                    confirm_text=(
-                        f"⚠️ Точно перевыпустить подписку «{owned.get('tarif', username)}»? "
-                        "Будет создана новая ссылка, старые устройства перестанут работать."
-                    ),
-                )
-                return ("pending_action", action)
-
-            if name == "delete_device":
-                username = str(args.get("subscription_username") or "").strip()
-                hwid = str(args.get("hwid") or "").strip()
-                owned = await user_info_service.find_own_subscription(owner_telegram_id, username=username)
-                if not owned or not hwid:
-                    return ("denied", "Подписка или устройство не найдены среди данных этого клиента — действие отклонено.")
-                action = PendingAction(
-                    action="delete_device",
-                    params={"subscription_username": username, "hwid": hwid},
-                    confirm_text=f"⚠️ Удалить это устройство из подписки «{owned.get('tarif', username)}»?",
-                )
-                return ("pending_action", action)
+                    )
+                elif name == "revoke_subscription":
+                    confirm_text = (
+                        f"⚠️ Точно перевыпустить ссылку подписки «{label}»? "
+                        "Будет создана новая ссылка, старые устройства перестанут работать. Срок подписки не продлевается."
+                    )
+                else:
+                    hwid = args.get("hwid")
+                    if not isinstance(hwid, str) or not hwid.strip():
+                        return ("denied", "Не указано устройство из выбранной подписки — действие отклонено.")
+                    action_params["hwid"] = hwid.strip()
+                    confirm_text = f"⚠️ Удалить это устройство из подписки «{label}»?"
+                return ("pending_action", PendingAction(action=name, params=action_params, confirm_text=confirm_text))
 
             return ("result", {"ok": False, "error": f"неизвестный инструмент {name}"})
         except Exception as e:
@@ -783,6 +822,9 @@ class AISupport:
         account_info = ctx.get("account_info") or ""
         if account_info and "{account_info}" not in tpl:
             system_prompt = f"{system_prompt}\n\n{account_info}"
+        payment_context = ctx.get("payment_context") or ""
+        if payment_context and "{payment_context}" not in tpl:
+            system_prompt = f"{system_prompt}\n\n{payment_context}"
 
         # Always retain account/KB context with custom templates and images.
         if "{service_context}" not in tpl:

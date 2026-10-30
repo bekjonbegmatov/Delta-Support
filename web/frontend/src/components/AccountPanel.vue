@@ -41,17 +41,17 @@
       <div v-if="subs.length" class="acc-section-title">
         Подписки ({{ activeSubs.length }} активных из {{ subs.length }})
       </div>
-      <div v-for="s in subs" :key="s.id" class="acc-card" :class="{ inactive: !s.is_currently_active }">
+      <div v-for="(s, index) in subs" :key="subscriptionKey(s, index)" class="acc-card" :class="{ inactive: !s.is_currently_active }">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-          <span style="font-weight:600;">{{ s.tarif || s.username || 'Подписка' }}</span>
+          <div style="display:flex; align-items:center; gap:4px; min-width:0;">
+            <span style="font-weight:600; overflow-wrap:anywhere;">{{ subscriptionCode(s) || 'Код подписки отсутствует' }}</span>
+            <Button v-if="subscriptionCode(s)" icon="pi pi-copy" text rounded size="small" aria-label="Скопировать код подписки" @click="copy(subscriptionCode(s))" />
+          </div>
           <Tag :severity="s.is_currently_active ? 'success' : 'secondary'" :value="s.is_currently_active ? 'активна' : 'неактивна'" />
         </div>
+        <div v-if="s.tarif" class="muted" style="font-size:12px; margin-top:4px;">Тариф: {{ s.tarif }}</div>
         <div v-if="subscriptionMeta(s)" class="muted" style="font-size:12px; margin-top:4px;">
           {{ subscriptionMeta(s) }}
-        </div>
-        <div v-if="s.username || s.short_id" class="acc-key-row">
-          <code class="acc-key">{{ s.username || s.short_id }}</code>
-          <Button icon="pi pi-copy" text rounded size="small" @click="copy(s.username || s.short_id)" />
         </div>
         <div v-if="s.subscription_url" class="acc-key-row">
           <code class="acc-key">{{ s.subscription_url }}</code>
@@ -97,6 +97,7 @@ const props = defineProps<{ chatId: number | null }>()
 const data = ref<any | null>(null)
 const error = ref('')
 const loading = ref(false)
+let accountRequest = 0
 
 const subs = computed(() => data.value?.connections?.remna_subscriptions || [])
 const activeSubs = computed(() => subs.value.filter((s: any) => s.is_currently_active))
@@ -106,6 +107,18 @@ const txs = computed(() => (data.value?.transactions || []).slice(0, 3))
 const hasBalance = computed(() => data.value?.user?.balance !== null && data.value?.user?.balance !== undefined)
 const hasTrialInfo = computed(() => data.value?.user?.trial_available !== null && data.value?.user?.trial_available !== undefined)
 const channelLabel = computed(() => data.value?.channel === 'remnawave' ? 'Remnawave v3+' : 'Support API')
+
+function subscriptionCode(subscription: any): string {
+  const displayName = typeof subscription.display_name === 'string' ? subscription.display_name.trim() : ''
+  const username = typeof subscription.username === 'string' ? subscription.username.trim() : ''
+  return displayName || username
+}
+
+function subscriptionKey(subscription: any, index: number): string {
+  if (subscription.id !== null && subscription.id !== undefined) return `id:${subscription.id}`
+  if (subscription.username) return `username:${subscription.username}`
+  return `unidentified:${index}`
+}
 
 function shortDate(iso?: string | null) {
   if (!iso) return '—'
@@ -153,22 +166,28 @@ async function copy(text: string) {
 }
 
 async function load(force = false) {
-  if (!props.chatId) return
+  const requestId = ++accountRequest
+  const chatId = props.chatId
+  if (!chatId) {
+    loading.value = false
+    return
+  }
   loading.value = true
   error.value = ''
   try {
-    const res = await fetch(`/api/chats/${props.chatId}/account${force ? '?force=true' : ''}`, { credentials: 'include' })
+    const res = await fetch(`/api/chats/${chatId}/account${force ? '?force=true' : ''}`, { credentials: 'include' })
     const d = await res.json()
-    if (d.ok) {
+    if (requestId !== accountRequest || props.chatId !== chatId) return
+    if (res.ok && d.ok) {
       data.value = d
     } else {
       data.value = null
       error.value = d.error || 'unknown'
     }
   } catch {
-    error.value = 'unknown'
+    if (requestId === accountRequest) error.value = 'unknown'
   } finally {
-    loading.value = false
+    if (requestId === accountRequest) loading.value = false
   }
 }
 

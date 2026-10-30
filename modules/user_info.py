@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from uuid import UUID
 
 import httpx
 
@@ -127,6 +128,42 @@ class PendingAction:
     action: str
     params: Dict = field(default_factory=dict)
     confirm_text: str = ""
+
+
+def subscription_display_name(subscription: Dict) -> str:
+    """A subscription code, never its non-unique tariff or owner's Telegram login."""
+    for key in ("display_name", "username"):
+        value = subscription.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Подписка без кода"
+
+
+def _normalise_subscription(subscription: Dict) -> Dict:
+    result = dict(subscription)
+    if not isinstance(result.get("display_name"), str) or not result["display_name"].strip():
+        username = result.get("username")
+        result["display_name"] = username.strip() if isinstance(username, str) and username.strip() else None
+    return result
+
+
+def _support_subscription_selector(username=None, subscription_id=None) -> Dict:
+    if isinstance(username, str) and username.strip():
+        return {"username": username.strip()}
+    if not isinstance(subscription_id, bool) and str(subscription_id).isdigit() and int(subscription_id) > 0:
+        return {"subscription_id": int(subscription_id)}
+    return {}
+
+
+def _payment_snapshot_label(status) -> str:
+    """Do not mistake a nonempty 'pending'/'failed' string for a paid flag."""
+    if status is True or status == 1 or str(status).casefold() in {"paid", "success", "succeeded", "completed", "confirmed"}:
+        return "оплачен"
+    if status is False or status == 0 or str(status).casefold() in {"pending", "waiting", "created", "running", "unpaid"}:
+        return "ожидает оплаты"
+    if str(status).casefold() in {"cancelled", "canceled", "failed", "expired"}:
+        return "отменён / не завершён"
+    return "статус не подтверждён"
 
 
 def _fmt_gb(value_bytes) -> str:
@@ -426,8 +463,9 @@ class UserInfoService:
                 data = {"ok": False, "error": "invalid_response"}
             if not isinstance(data, dict):
                 data = {"ok": False, "error": "invalid_response"}
-            data.setdefault("http_status", resp.status_code)
+            data["http_status"] = resp.status_code
             if resp.status_code != 200:
+                data["ok"] = False
                 logger.warning(f"Support API: HTTP {resp.status_code} для {path}: {data.get('error')}")
                 return data
             if not data.get("ok"):
@@ -480,6 +518,7 @@ class UserInfoService:
                     {
                         "id": sub.get("id"),
                         "username": sub.get("username"),
+                        "display_name": sub.get("display_name") or sub.get("username"),
                         "tarif": sub.get("tarif"),
                         "is_currently_active": sub.get("is_currently_active"),
                         "subscription_url": subscription_url,
@@ -504,26 +543,38 @@ class UserInfoService:
         url = f"{self.support_api_url}/api/support/user_info"
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
+                resp = await client.get(
                     url,
                     headers={
                         "Content-Type": "application/json",
                         "Authorization": f"Bearer {self.support_api_token}",
                     },
-                    json={"user_id": int(telegram_id)},
+                    params={"user_id": int(telegram_id)},
                     timeout=10.0,
                 )
             if resp.status_code != 200:
                 logger.warning(f"Support API: HTTP {resp.status_code} для user {telegram_id}")
                 return None
             data = resp.json()
-            if not data.get("ok"):
+            if not isinstance(data, dict) or not data.get("ok"):
+                if not isinstance(data, dict):
+                    return None
                 if data.get("error") == "user_not_found":
                     self._user_cache[key] = (now, None)
                 else:
                     logger.warning(f"Support API error: {data.get('error')}")
                 return None
+            owner_id = (data.get("user") or {}).get("telegram_id")
+            if owner_id is not None and str(owner_id) != str(telegram_id):
+                logger.warning("Support API user_info returned another client's account")
+                return None
             data["channel"] = "support_api"
+            connections = dict(data.get("connections") or {})
+            connections["remna_subscriptions"] = [
+                _normalise_subscription(sub) for sub in (connections.get("remna_subscriptions") or [])
+                if isinstance(sub, dict)
+            ]
+            data["connections"] = connections
             self._user_cache[key] = (now, data)
             self._prune_cache()
             return data
@@ -583,6 +634,7 @@ class UserInfoService:
                     "uuid": user_uuid or None,
                     "short_id": short_uuid or None,
                     "username": user.get("username"),
+                    "display_name": user.get("username"),
                     "tarif": self._remna_tariff_label(user),
                     "status": self._remna_status_label(user),
                     "status_label": self._remna_status_label(user),
@@ -690,6 +742,16 @@ class UserInfoService:
         await self._refresh_settings()
         if self.active_channel != "support_api" or not self.tool_enabled("create_payment", "support_api"):
             return None
+        # UUID is chosen once for an explicit invoice intent by the caller. This
+        # transport never generates another key or retries a failed creation.
+        try:
+            UUID(str(idempotency_key))
+        except (TypeError, ValueError, AttributeError):
+            return {"ok": False, "error": "invalid_idempotency_key"}
+        if isinstance(owner_telegram_id, bool) or not str(owner_telegram_id).isdigit() or int(owner_telegram_id) <= 0:
+            return {"ok": False, "error": "invalid_user_id"}
+        if isinstance(amount, bool) or not str(amount).isdigit():
+            return {"ok": False, "error": "invalid_amount"}
         try:
             amount_value = int(amount)
         except (TypeError, ValueError):
@@ -708,6 +770,7 @@ class UserInfoService:
         )
 
     async def check_payment(self, transaction_id: str, owner_telegram_id: int) -> Optional[Dict]:
+        """Fetch the current status; never reuse the create-payment snapshot."""
         await self._refresh_settings()
         if self.active_channel != "support_api" or not self.tool_enabled("check_payment", "support_api"):
             return None
@@ -719,11 +782,11 @@ class UserInfoService:
         if not data or not data.get("ok"):
             return data
         owner = (data.get("user") or {}).get("telegram_id")
-        if owner is not None and int(owner) != int(owner_telegram_id):
+        if owner is None or isinstance(owner, bool) or str(owner) != str(owner_telegram_id):
             logger.warning(
-                f"Support API: попытка получить чужую транзакцию {transaction_id} (owner={owner}, requester={owner_telegram_id})"
+                "Support API: владелец платежа не подтверждён для текущего клиента"
             )
-            return None
+            return {"ok": False, "error": "payment_owner_unverified"}
         return data
 
     async def get_own_subscriptions(self, telegram_id: int) -> List[Dict]:
@@ -733,29 +796,45 @@ class UserInfoService:
             data = await self.get_user_info(telegram_id)
         if not data:
             return []
-        return (data.get("connections") or {}).get("remna_subscriptions") or []
+        return [_normalise_subscription(sub) for sub in (data.get("connections") or {}).get("remna_subscriptions") or []
+                if isinstance(sub, dict)]
 
     async def find_own_subscription(
         self,
         telegram_id: int,
         username: Optional[str] = None,
         short_id: Optional[str] = None,
+        subscription_id: Optional[int] = None,
     ) -> Optional[Dict]:
+        if not username and not short_id and subscription_id is None:
+            return None
+        if isinstance(subscription_id, bool):
+            return None
         subs = await self.get_own_subscriptions(telegram_id)
         for sub in subs:
-            if username and sub.get("username") == username:
-                return sub
-            if short_id and sub.get("short_id") == short_id:
-                return sub
+            # Every provided selector must identify this same owned subscription.
+            # Neither tariff nor the account owner's Telegram username is a selector.
+            if username and sub.get("username") != username:
+                continue
+            if short_id and sub.get("short_id") != short_id:
+                continue
+            if subscription_id is not None and str(sub.get("id")) != str(subscription_id):
+                continue
+            return sub
         return None
 
-    async def get_subscription_info(self, username: Optional[str] = None, short_id: Optional[str] = None) -> Optional[Dict]:
+    async def get_subscription_info(self, username: Optional[str] = None, short_id: Optional[str] = None, subscription_id: Optional[int] = None) -> Optional[Dict]:
         await self._refresh_settings()
         if not self.tool_enabled("get_subscription_info"):
             return None
         if self.active_channel == "support_api":
-            payload = {"username": username} if username else {"short_id": short_id}
-            return await self._support_api_post("/api/support/subscription_info", payload)
+            selector = _support_subscription_selector(username, subscription_id)
+            if not selector:
+                return {"ok": False, "error": "subscription_identifier_required"}
+            data = await self._support_api_request("GET", "/api/support/subscription_info", params=selector)
+            if data and isinstance(data.get("subscription"), dict):
+                data = {**data, "subscription": _normalise_subscription(data["subscription"])}
+            return data
         if self.active_channel != "remnawave":
             return None
         try:
@@ -786,14 +865,19 @@ class UserInfoService:
             return None
         return None
 
-    async def get_subscription_devices(self, username: str) -> Optional[Dict]:
+    async def get_subscription_devices(self, username: Optional[str] = None, subscription_id: Optional[int] = None) -> Optional[Dict]:
         await self._refresh_settings()
         if not self.tool_enabled("get_subscription_devices"):
             return None
         if self.active_channel == "support_api":
-            return await self._support_api_post("/api/support/subscription/devices", {"username": username})
+            selector = _support_subscription_selector(username, subscription_id)
+            if not selector:
+                return {"ok": False, "error": "subscription_identifier_required"}
+            return await self._support_api_request("GET", "/api/support/subscription/devices", params=selector)
         if self.active_channel != "remnawave":
             return None
+        if not username:
+            return {"ok": False, "error": "subscription_identifier_required"}
         try:
             async with self._remnawave_api() as api:
                 user = await api.get_user_by_username(username)
@@ -811,14 +895,21 @@ class UserInfoService:
             logger.warning(f"Remnawave devices failed: {e}")
             return None
 
-    async def delete_device(self, username: str, hwid: str) -> Optional[Dict]:
+    async def delete_device(self, username: Optional[str] = None, hwid: str = "", subscription_id: Optional[int] = None) -> Optional[Dict]:
         await self._refresh_settings()
         if not self.tool_enabled("delete_device"):
             return None
+        if not isinstance(hwid, str) or not hwid.strip():
+            return {"ok": False, "error": "hwid_required"}
         if self.active_channel == "support_api":
-            return await self._support_api_post("/api/support/subscription/device/delete", {"username": username, "hwid": hwid})
+            selector = _support_subscription_selector(username, subscription_id)
+            if not selector:
+                return {"ok": False, "error": "subscription_identifier_required"}
+            return await self._support_api_post("/api/support/subscription/device/delete", {**selector, "hwid": hwid})
         if self.active_channel != "remnawave":
             return None
+        if not username:
+            return {"ok": False, "error": "subscription_identifier_required"}
         try:
             async with self._remnawave_api() as api:
                 user = await api.get_user_by_username(username)
@@ -830,17 +921,22 @@ class UserInfoService:
             logger.warning(f"Remnawave delete device failed: {e}")
             return {"ok": False}
 
-    async def reset_devices(self, short_id: str) -> Optional[Dict]:
+    async def reset_devices(self, short_id: Optional[str] = None, *, username: Optional[str] = None, subscription_id: Optional[int] = None) -> Optional[Dict]:
         await self._refresh_settings()
         if not self.tool_enabled("reset_devices"):
             return None
         if self.active_channel == "support_api":
-            return await self._support_api_post("/api/support/subscription/devices/reset", {"short_id": short_id})
+            selector = _support_subscription_selector(username, subscription_id)
+            if not selector:
+                return {"ok": False, "error": "subscription_identifier_required"}
+            return await self._support_api_post("/api/support/subscription/devices/reset", selector)
         if self.active_channel != "remnawave":
             return None
+        if not username and not short_id:
+            return {"ok": False, "error": "subscription_identifier_required"}
         try:
             async with self._remnawave_api() as api:
-                user = await api.get_user_by_short_uuid(short_id)
+                user = await api.get_user_by_username(username) if username else await api.get_user_by_short_uuid(short_id)
                 if not user:
                     return {"ok": False, "error": "user_not_found"}
                 ok = await api.reset_user_devices(str(user.get("uuid") or user.get("id") or ""))
@@ -849,14 +945,20 @@ class UserInfoService:
             logger.warning(f"Remnawave reset devices failed: {e}")
             return {"ok": False}
 
-    async def revoke_subscription(self, username: str) -> Optional[Dict]:
+    async def revoke_subscription(self, username: Optional[str] = None, subscription_id: Optional[int] = None) -> Optional[Dict]:
+        """Reissue the subscription link; this does not extend its expiry."""
         await self._refresh_settings()
         if not self.tool_enabled("revoke_subscription"):
             return None
         if self.active_channel == "support_api":
-            return await self._support_api_post("/api/support/subscription/revoke", {"username": username})
+            selector = _support_subscription_selector(username, subscription_id)
+            if not selector:
+                return {"ok": False, "error": "subscription_identifier_required"}
+            return await self._support_api_post("/api/support/subscription/revoke", selector)
         if self.active_channel != "remnawave":
             return None
+        if not username:
+            return {"ok": False, "error": "subscription_identifier_required"}
         try:
             async with self._remnawave_api() as api:
                 user = await api.get_user_by_username(username)
@@ -892,7 +994,7 @@ class UserInfoService:
         parts.append(
             f"- Подписок: всего {summary.get('remna_subscriptions_count', len(subs))}, активных {summary.get('active_remna_subscriptions_count', len(active_subs))}"
         )
-        for s in active_subs[:6]:
+        for s in subs[:12]:
             limit = s.get("traffic_limit_bytes") or 0
             traffic = f"{_fmt_gb(s.get('traffic_used_bytes'))} ГБ из {'безлимит' if not limit else _fmt_gb(limit) + ' ГБ'}"
             extras = []
@@ -901,11 +1003,15 @@ class UserInfoService:
             if s.get("device_limit"):
                 extras.append(f"устройств: {s['device_limit']}")
             extra_txt = f" ({', '.join(extras)})" if extras else ""
-            parts.append(f"  • «{s.get('tarif', '?')}» до {_fmt_date(s.get('expire_at'))}, трафик {traffic}{extra_txt}")
+            parts.append(
+                f"  • «{subscription_display_name(s)}» / username {s.get('username') or 'не указан'} / subscription_id {s.get('id') or 'не указан'}: "
+                f"тариф «{s.get('tarif') or 'не указан'}», {'активна' if s.get('is_currently_active') else 'неактивна'}, "
+                f"до {_fmt_date(s.get('expire_at'))}, трафик {traffic}{extra_txt}"
+            )
             if s.get("subscription_url"):
                 parts.append(f"    subscription_url: {s.get('subscription_url')}")
-        if len(active_subs) > 6:
-            parts.append(f"  • ... и еще {len(active_subs) - 6} активных подписок")
+        if len(subs) > 12:
+            parts.append(f"  • ... и еще {len(subs) - 12} подписок")
         if inactive_count > 0:
             parts.append(f"  • неактивных/истекших: {inactive_count}")
         outline = conn.get("outline_keys") or []
@@ -921,10 +1027,10 @@ class UserInfoService:
                 parts.append(f"  • «{k.get('name', '?')}» сервер {k.get('server', '?')}, {'работает' if k.get('is_valid') else 'НЕ работает'}")
         txs = data.get("transactions") or []
         if txs:
-            parts.append("- Последние платежи:")
+            parts.append("- Последние платежи (снимок аккаунта; текущий статус проверяй через check_payment):")
             for t in txs[:3]:
-                status = "✅ оплачен" if t.get("status") else "⏳ не оплачен"
-                parts.append(f"  • {t.get('summa', '?')} руб. через {t.get('method_label') or t.get('method', '?')}, {status}, {_fmt_datetime(t.get('created'))}")
+                status = _payment_snapshot_label(t.get("status"))
+                parts.append(f"  • {t.get('summa', '?')} руб. через {t.get('method_label') or t.get('method', '?')}, {status}, {_fmt_datetime(t.get('created'))}; order_id/transaction_id: {t.get('order_id') or t.get('transaction_id') or t.get('id') or 'не указан'}")
         acts = data.get("actions") or []
         if acts:
             parts.append("- Последние действия по балансу:")
@@ -933,7 +1039,11 @@ class UserInfoService:
                     f"  • {a.get('action_label') or a.get('action', '?')}: {a.get('amount', '?')} руб. ({_fmt_datetime(a.get('created_at'))}), баланс {a.get('balance_before', '?')} → {a.get('balance_after', '?')}"
                 )
         parts.append(
-            "Используй эти данные для точных ответов о балансе, подписках и ключах пользователя. Не выдумывай данные, которых здесь нет."
+            "Показывай клиенту код display_name (fallback username). Тариф не уникален и не является идентификатором. "
+            "Для инструментов выбирай username или subscription_id именно нужной подписки; user.username — логин Telegram владельца. "
+            "Перевыпуск ссылки не продлевает подписку. Статус платежа проверяй через check_payment по order_id/transaction_id. "
+            "Снимок создания счета, переход по ссылке и возврат со страницы оплаты не подтверждают оплату. "
+            "Не выдумывай данные, которых здесь нет."
         )
         return "\n".join(parts)
 
@@ -957,7 +1067,7 @@ class UserInfoService:
         for sub in subs[:8]:
             if not self._subscription_has_profile_details(sub):
                 url_mark = f"subscription_url: {sub.get('subscription_url')}" if sub.get("subscription_url") else "subscription_url скрыта"
-                parts.append(f"  • «{sub.get('tarif') or sub.get('username') or '?'}» / username {sub.get('username', '?')}: {url_mark}")
+                parts.append(f"  • «{subscription_display_name(sub)}» (тариф «{sub.get('tarif') or 'не указан'}») / username {sub.get('username', '?')}: {url_mark}")
                 continue
             limit = sub.get("traffic_limit_bytes") or 0
             traffic = f"{_fmt_gb(sub.get('traffic_used_bytes'))} ГБ из {'безлимит' if not limit else _fmt_gb(limit) + ' ГБ'}"
@@ -968,7 +1078,7 @@ class UserInfoService:
                 extra.append(f"онлайн: {_fmt_datetime(sub.get('online_at'))}")
             extra_txt = f" ({', '.join(extra)})" if extra else ""
             parts.append(
-                f"  • «{sub.get('tarif') or sub.get('username') or '?'}» / username {sub.get('username', '?')} / short_id {sub.get('short_id', '?')}: "
+                f"  • «{subscription_display_name(sub)}» (тариф «{sub.get('tarif') or 'не указан'}») / username {sub.get('username', '?')} / short_id {sub.get('short_id', '?')}: "
                 f"статус {sub.get('status_label', '?')}, до {_fmt_date(sub.get('expire_at'))}, трафик {traffic}{extra_txt}"
             )
             if sub.get("subscription_url"):
@@ -1002,12 +1112,12 @@ class UserInfoService:
         parts.append(
             f"• Подписки: {summary.get('active_remna_subscriptions_count', len(active_subs))} актив. из {summary.get('remna_subscriptions_count', len(subs))}"
         )
-        for s in active_subs[:4]:
+        for s in subs[:6]:
             limit = s.get("traffic_limit_bytes") or 0
             traffic = f"{_fmt_gb(s.get('traffic_used_bytes'))}/{'∞' if not limit else _fmt_gb(limit)} ГБ"
-            parts.append(f"   – «{s.get('tarif', '?')}» до {_fmt_date(s.get('expire_at'))}, {traffic}")
-        if len(active_subs) > 4:
-            parts.append(f"   – ... еще {len(active_subs) - 4}")
+            parts.append(f"   – «{subscription_display_name(s)}» (тариф «{s.get('tarif') or 'не указан'}», {'активна' if s.get('is_currently_active') else 'неактивна'}) до {_fmt_date(s.get('expire_at'))}, {traffic}")
+        if len(subs) > 6:
+            parts.append(f"   – ... еще {len(subs) - 6}")
         outline_n = summary.get("outline_keys_count", len(conn.get("outline_keys") or []))
         xray = conn.get("xray_keys") or []
         xray_valid = summary.get("valid_xray_keys_count", sum(1 for k in xray if k.get("is_valid")))
@@ -1015,8 +1125,8 @@ class UserInfoService:
         txs = data.get("transactions") or []
         if txs:
             t = txs[0]
-            status = "оплачен" if t.get("status") else "НЕ оплачен"
-            parts.append(f"• Последний платеж: {t.get('summa', '?')} руб. ({t.get('method_label') or t.get('method', '?')}), {status}, {_fmt_datetime(t.get('created'))}")
+            status = _payment_snapshot_label(t.get("status"))
+            parts.append(f"• Последний платеж (снимок): {t.get('summa', '?')} руб. ({t.get('method_label') or t.get('method', '?')}), {status}, {_fmt_datetime(t.get('created'))}")
         return "\n".join(parts)
 
     def _format_remnawave_for_manager(self, data: Dict) -> str:
@@ -1038,13 +1148,13 @@ class UserInfoService:
         for sub in subs[:4]:
             if not self._subscription_has_profile_details(sub):
                 links_mark = f"subscription_url: {sub.get('subscription_url')}" if sub.get("subscription_url") else "без ссылки"
-                parts.append(f"   – {sub.get('username', '?')}: {links_mark}")
+                parts.append(f"   – {subscription_display_name(sub)}: {links_mark}")
                 continue
             limit = sub.get("traffic_limit_bytes") or 0
             traffic = f"{_fmt_gb(sub.get('traffic_used_bytes'))}/{'∞' if not limit else _fmt_gb(limit)} ГБ"
             links_mark = "есть ссылка" if sub.get("subscription_url") else "без ссылки"
             parts.append(
-                f"   – {sub.get('username', '?')} ({sub.get('status_label', '?')}) до {_fmt_date(sub.get('expire_at'))}, {traffic}, {links_mark}"
+                f"   – {subscription_display_name(sub)} ({sub.get('status_label', '?')}) до {_fmt_date(sub.get('expire_at'))}, {traffic}, {links_mark}"
             )
         if len(subs) > 4:
             parts.append(f"   – ... еще {len(subs) - 4}")
