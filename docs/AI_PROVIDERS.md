@@ -24,6 +24,7 @@
 | Тип | Base URL по умолчанию |
 |---|---|
 | `groq` | `https://api.groq.com/openai/v1` |
+| `openai_v2` (Responses API) | `https://api.openai.com/v1` |
 | `openai` | `https://api.openai.com/v1` |
 | `anthropic` | `https://api.anthropic.com/v1` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta` |
@@ -31,7 +32,20 @@
 | `mistral` | `https://api.mistral.ai/v1` |
 | `openrouter` | `https://openrouter.ai/api/v1` |
 
-Запросы уходят в формате OpenAI Chat Completions (`/chat/completions`), поэтому реально работают провайдеры с OpenAI-совместимым API — это все из списка выше, кроме нюансов у Anthropic/Gemini (у них своя схема API, для них может потребоваться прокси-совместимость на стороне base_url).
+OpenAI v2 использует `/responses`. Остальные типы в клиентском диалоге используют OpenAI Chat Completions (`/chat/completions`); для нативных Anthropic/Gemini по-прежнему нужен совместимый прокси.
+
+## OpenAI v2: настройка
+
+1. Добавьте провайдера **OpenAI v2 (Responses API)**, укажите API-ключ и оставьте Base URL `https://api.openai.com/v1` (или адрес совместимого прокси).
+2. После ввода ключа список моделей загружается из `/models`. Можно обновить его кнопкой, найти модель по ID или ввести ID вручную. Выбранная модель не меняется автоматически; API моделей не гарантирует поддержку каждой модальности/инструмента.
+3. Нажмите «Проверить» и сохраните. Установите меньший приоритет, если этот провайдер должен отвечать первым.
+4. В «Настройки → Бот» выберите потоковый режим, в «Автоматизация» включите разбор фото.
+
+Для v2 применяется `max_output_tokens`; для современных OpenAI Chat Completions — `max_completion_tokens`, без неподдерживаемого `temperature` у reasoning-моделей. Цепочка инструментов сохраняет исходные output/reasoning items и `call_id`; `store=false` не создаёт серверное хранилище диалогов в Responses. История берётся из локальной БД.
+
+SSE обрабатывается до события завершения; оборванный или incomplete ответ не считается успешным. Служебные аргументы и reasoning не отправляются клиенту. Инструменты доступны и при разборе изображений.
+
+Реализация сверена с [Function calling](https://developers.openai.com/api/docs/guides/function-calling?api-mode=responses), [Streaming responses](https://developers.openai.com/api/docs/guides/streaming-responses) и [Images and vision](https://developers.openai.com/api/docs/guides/images-vision).
 
 ## Поля провайдера
 
@@ -52,10 +66,10 @@
 
 ## Vision-модели: распознавание фото
 
-Когда клиент присылает фото (скриншот ошибки, экрана приложения) и в настройках [Автоматизации](AUTOMATION.md) включён разбор изображений — бот ищет среди активных провайдеров модель, поддерживающую изображения. Определяется по имени модели — подходят модели, содержащие в названии:
+Когда клиент присылает фото или документ-картинку PNG/JPEG/WebP/GIF до 10 МБ (скриншот ошибки, экрана приложения) и в настройках [Автоматизации](AUTOMATION.md) включён разбор изображений — бот ищет среди активных провайдеров модель, поддерживающую изображения. Для OpenAI v2 изображение отправляется выбранной модели; окончательную поддержку проверяет API. Для остальных типов используется предварительный отбор по имени модели:
 
 ```
-llama-4, scout, maverick, vision, gpt-4, gpt-5, gemini, claude, qwen-vl, qwen3.6, pixtral
+llama-4, scout, maverick, vision, gpt-4, gpt-5, gpt-6, chatgpt, o3, o4, gemini, claude, qwen-vl, qwen3.6, pixtral
 ```
 
 Например, `qwen/qwen3.6-27b` на Groq. Если ни один активный провайдер не подходит — бот сообщит клиенту, что нужно описать проблему текстом или подключить менеджера.

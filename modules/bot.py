@@ -8,6 +8,7 @@ import redis
 import html
 import re
 import time
+from weakref import WeakValueDictionary
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -25,6 +26,7 @@ from typing import Optional
 from modules.config import Config
 from modules.database import Database, Message, SystemConfig
 from modules.ai_support import AISupport
+from modules.ai_policy import should_offer_manager
 from modules.user_info import UserInfoService, PendingAction
 from modules.telegram_streaming import TelegramDraft
 
@@ -86,6 +88,10 @@ class SupportBot:
         self._sla_ping_enabled = True
         self._sla_ping_minutes = 15               # повторный пинг, если запрос никто не взял
         self._lifecycle_task = None
+        self._chat_retention_days = 90
+        self._retention_checked_at = 0.0
+        self._retention_cursor = 0
+        self._client_chat_locks = WeakValueDictionary()
         # Разрушающие действия (сброс устройств, перевыпуск подписки), ожидающие
         # подтверждения клиента: token -> {"expires": ts, "data": {...}}.
         # Fallback на память процесса, если Redis недоступен (TTL 5 минут).
@@ -393,6 +399,7 @@ class SupportBot:
             "bot_welcome_message",
             "banned_users",
             "auto_close_enabled",
+            "chat_retention_days",
             "auto_close_reminder_minutes",
             "auto_close_after_minutes",
             "auto_close_reminder_text",
@@ -463,6 +470,7 @@ class SupportBot:
             return max(minimum, int(raw)) if raw.lstrip("-").isdigit() else default
 
         self._auto_close_enabled = _as_bool("auto_close_enabled", False)
+        self._chat_retention_days = _as_int("chat_retention_days", 90, minimum=0)
         self._auto_close_reminder_minutes = _as_int("auto_close_reminder_minutes", 360, minimum=5)
         self._auto_close_after_minutes = _as_int("auto_close_after_minutes", 720, minimum=5)
         self._sla_ping_enabled = _as_bool("sla_ping_enabled", True)
@@ -570,6 +578,10 @@ class SupportBot:
         if self._lifecycle_task:
             self._lifecycle_task.cancel()
             self._lifecycle_task = None
+        self._chat_retention_days = 90
+        self._retention_checked_at = 0.0
+        self._retention_cursor = 0
+        self._client_chat_locks = WeakValueDictionary()
         if self.application.updater:
             await self.application.updater.stop()
         if self.application:
@@ -590,6 +602,39 @@ class SupportBot:
         except (KeyboardInterrupt, asyncio.CancelledError):
             await self.stop()
     
+    def _client_chat_lock(self, user_id: int):
+        lock = self._client_chat_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_chat_locks[user_id] = lock
+        return lock
+
+    async def _get_client_chat(self, user):
+        chat = await self.db.get_chat_by_user_id(user.id)
+        if not chat:
+            return await self.db.create_chat(
+                user_id=user.id, username=user.username,
+                first_name=user.first_name, last_name=user.last_name,
+            )
+        if chat.status == "closed":
+            chat = await self.db.reopen_chat(chat)
+            self._clear_manager_header(chat.id)
+            if self.ws_manager:
+                try:
+                    await self.ws_manager.broadcast("status_changed", {"chat_id": chat.id, "status": chat.status})
+                except Exception as error:
+                    logger.warning(f"Failed to broadcast reopened chat: {error}")
+            if self._group_id:
+                await self._edit_group_topic_status(chat, role_hint="client")
+        return chat
+
+    async def _save_client_message(self, user, info):
+        # Retention must not delete a chat between finding it and saving its new message.
+        async with self._client_chat_lock(user.id):
+            chat = await self._get_client_chat(user)
+            message = await self._save_message_to_db(chat.id, user.id, info, "user")
+            return chat, message
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         user = update.effective_user
@@ -616,19 +661,9 @@ class SupportBot:
             )
             return
         
-        # Обычный пользователь
-        # Проверяем, есть ли активный чат
-        chat = await self.db.get_chat_by_user_id(user_id)
-        
-        if not chat:
-            # Создаем новый чат
-            chat = await self.db.create_chat(
-                user_id=user_id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name
-            )
-            logger.info(f"Created new chat for user {user_id}")
+        # Закрытый диалог продолжается с прежней историей и топиком.
+        async with self._client_chat_lock(user_id):
+            chat = await self._get_client_chat(user)
 
         await self.refresh_runtime_settings()
 
@@ -847,14 +882,8 @@ class SupportBot:
             if not thread_id:
                 await update.message.reply_text("❌ Команда должна выполняться внутри топика форума.")
                 return
-            chat_id = None
-            if self.redis:
-                cid = self.redis.get(f"group_topic:thread:{thread_id}")
-                if cid:
-                    try:
-                        chat_id = int(cid)
-                    except:
-                        chat_id = None
+            chat = await self._chat_from_topic(update)
+            chat_id = chat.id if chat else None
             if not chat_id:
                 await update.message.reply_text("❌ Топик не привязан к чату клиента.")
                 return
@@ -1240,39 +1269,14 @@ class SupportBot:
                 )
             return
         
-        # Обычный пользователь
-        chat = await self.db.get_chat_by_user_id(user_id)
-        
-        if not chat:
-            chat = await self.db.create_chat(
-                user_id=user_id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name
-            )
-        
-        # Сохраняем сообщение пользователя
-        await self.db.add_message(chat.id, user_id, message_text, "user")
-        
+        chat, saved_msg = await self._save_client_message(user, {"kind": "text", "text": message_text})
+
         # Если чат уже с менеджером, пересылаем сообщение менеджеру
-        if chat.status == "waiting_manager" and chat.manager_id:
-            try:
-                # Пересылаем сообщение менеджеру
-                user_info = f"@{user.username}" if user.username else f"{user.first_name or 'Пользователь'}"
-                await self.application.bot.send_message(
-                    chat_id=chat.manager_id,
-                    text=f"💬 {user_info} (Чат #{chat.id}):\n{message_text}"
-                )
-                await update.message.reply_text(
-                    "✅ Ваше сообщение отправлено менеджеру. Ожидайте ответа."
-                )
-            except Exception as e:
-                logger.error(f"Error forwarding message to manager: {e}")
-                await update.message.reply_text(
-                    "✅ Ваше сообщение сохранено. Менеджер скоро ответит."
-                )
+        if chat.status == "waiting_manager":
+            await self._forward_to_manager(chat, user, {"kind": "text", "text": message_text, "message_id": update.message.message_id}, update)
             return
-        
+        if getattr(chat, "ai_disabled", False):
+            return
         # Получаем историю чата
         chat_messages = await self.db.get_chat_messages(chat.id, limit=20)
         chat_history = [
@@ -1281,12 +1285,13 @@ class SupportBot:
                 "message": msg.content
             }
             for msg in chat_messages
-            if (getattr(msg, "source", None) or "") != "ai_tool"
+            if msg.id != saved_msg.id and msg.message_type in {"user", "ai", "manager"} and getattr(msg, "source", None) not in {"system", "ai_tool"}
         ]
         
         # Получаем ответ от AI
         context = {
             "user_id": user_id,
+            "chat_id": chat.id,
             "username": user.username,
             "first_name": user.first_name,
             "last_name": user.last_name
@@ -1295,17 +1300,21 @@ class SupportBot:
         typing_stop, typing_task = self._start_typing(update.effective_chat.id if update.effective_chat else user_id)
         try:
             ai_response = await self.ai.get_ai_answer(
-                message_text, context, chat_history, stream_callback=self._ai_stream_callback(update),
+                message_text, context, chat_history, execute_tools=True, user_info_service=self.user_info,
+                stream_callback=self._ai_stream_callback(update),
             )
         finally:
             await self._stop_typing(typing_stop, typing_task)
         
+        if isinstance(ai_response, PendingAction):
+            await self._send_pending_action_confirmation(update, chat, ai_response)
+            return
         if ai_response:
             # Сохраняем ответ AI
             await self._save_message_to_db(chat.id, user_id, {"kind": "text", "text": ai_response}, "ai")
             
             # Проверяем, нужно ли предложить менеджера
-            if any(keyword in ai_response.lower() for keyword in ["менеджер", "пригласить", "подключить"]):
+            if should_offer_manager(ai_response, message_text):
                 keyboard = [
                     [InlineKeyboardButton("Да, пригласите менеджера", callback_data=f"request_manager_{chat.id}")]
                 ]
@@ -1335,6 +1344,10 @@ class SupportBot:
                 pass
             return
         
+        if chat.status == "waiting_manager":
+            await query.edit_message_text("✅ Менеджер уже приглашён. Ваш запрос остаётся в очереди, повторно отправлять его не нужно.")
+            return
+
         # Обновляем статус чата
         try:
             await self.db.update_chat_status(chat_id, "waiting_manager")
@@ -1507,7 +1520,7 @@ class SupportBot:
             hist = [
                 {"role": "user" if m.message_type == "user" else "assistant", "message": m.content}
                 for m in messages
-                if (getattr(m, "source", None) or "") != "ai_tool"
+                if m.message_type in {"user", "ai", "manager"} and getattr(m, "source", None) not in {"system", "ai_tool"}
             ]
             return await self.ai.get_ai_answer(prompt, ctx, hist)
         except Exception as e:
@@ -1522,18 +1535,17 @@ class SupportBot:
         thread_id = update.message.message_thread_id if update.message else None
         if not thread_id:
             return None
-        chat_id = None
-        if self.redis:
-            try:
-                cid = self.redis.get(f"group_topic:thread:{thread_id}")
-                chat_id = int(cid) if cid else None
-            except Exception:
-                chat_id = None
-        if chat_id:
-            return await self.db.get_chat_by_id(chat_id)
-        # Fallback: привязка топика хранится и в БД
         from modules.database import Chat as ChatModel
-        return await ChatModel.filter(topic_id=thread_id).order_by("-id").first()
+        chat = await ChatModel.filter(topic_id=thread_id, topic_group_id=self._group_id).order_by("-id").first()
+        if not chat:
+            # Before topic_group_id existed, the installation had one support group.
+            chat = await ChatModel.filter(topic_id=thread_id, topic_group_id=None).order_by("-id").first()
+            if chat:
+                await ChatModel.filter(id=chat.id).update(topic_group_id=self._group_id)
+                chat.topic_group_id = self._group_id
+        if chat:
+            self._cache_group_topic(chat.id, thread_id)
+        return chat
 
     async def _resolve_command_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Чат для команды: топик группы или аргумент <chat_id> в личке"""
@@ -2092,6 +2104,9 @@ class SupportBot:
         while True:
             try:
                 await self.refresh_runtime_settings()
+                if not self._retention_checked_at or time.monotonic() - self._retention_checked_at >= 3600:
+                    await self._run_retention_cleanup()
+                    self._retention_checked_at = time.monotonic()
                 if self._auto_close_enabled:
                     await self._run_auto_close()
                 if self._sla_ping_enabled:
@@ -2104,6 +2119,75 @@ class SupportBot:
                 logger.warning(f"Lifecycle loop error: {e}")
             await asyncio.sleep(60)
 
+    async def _run_retention_cleanup(self):
+        """Удалить неактивные диалоги вместе с топиками; при ошибке Telegram повторить позже."""
+        from datetime import datetime, timedelta, timezone
+        from tortoise.expressions import Q
+        from modules.database import Chat as ChatModel
+
+        if self._chat_retention_days <= 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self._chat_retention_days)
+        expired = Q(last_message_at__lt=cutoff) | Q(last_message_at=None, created_at__lt=cutoff)
+        candidates = await ChatModel.filter(expired, id__gt=self._retention_cursor).order_by("id").limit(100).all()
+        if len(candidates) < 100:
+            self._retention_cursor = 0
+        elif candidates:
+            self._retention_cursor = candidates[-1].id
+        for candidate in candidates:
+            try:
+                async with self._client_chat_lock(candidate.user_id):
+                    # Recheck activity: a message may have arrived after the initial query.
+                    chat = await ChatModel.filter(expired, id=candidate.id).first()
+                    if not chat:
+                        continue
+                    topic_id = chat.topic_id
+                    group_id = chat.topic_group_id or self._group_id
+                    if not topic_id and self.redis:
+                        try:
+                            cached = self.redis.get(f"group_topic:chat:{chat.id}")
+                            topic_id = int(cached) if cached else None
+                        except Exception as error:
+                            logger.debug(f"Retention topic cache unavailable: {error}")
+                    if topic_id:
+                        if not group_id or not self.application:
+                            # Keep the relation until we can also remove its Telegram topic.
+                            continue
+                        try:
+                            await self.application.bot.delete_forum_topic(
+                                chat_id=group_id, message_thread_id=int(topic_id),
+                            )
+                        except BadRequest as error:
+                            reason = str(error).lower()
+                            if not any(marker in reason for marker in (
+                                "topic_deleted", "topic_id_invalid", "message_thread_not_found", "message thread not found",
+                                "thread not found", "topic not found",
+                            )):
+                                raise
+                        # If an external writer added activity during the API call, preserve
+                        # that history and recreate its now-missing topic on the next message.
+                        await ChatModel.filter(id=chat.id).update(topic_id=None, topic_group_id=None)
+                    deleted = await ChatModel.filter(expired, id=chat.id).delete()
+                    if self.redis:
+                        keys = [f"group_topic:chat:{chat.id}", f"manager_header:{chat.id}", f"waiting_ack:{chat.id}"]
+                        if topic_id:
+                            keys += [f"group_topic:thread:{topic_id}", f"group_topic:pin:{topic_id}", f"group_topic:name:{topic_id}",
+                                     f"group_topic:thread:{group_id}:{topic_id}", f"group_topic:pin:{group_id}:{topic_id}", f"group_topic:name:{group_id}:{topic_id}"]
+                        try:
+                            self.redis.delete(*keys)
+                            if chat.manager_id and self._get_manager_active_chat(chat.manager_id) == chat.id:
+                                self.redis.delete(f"manager_active_chat:{chat.manager_id}")
+                        except Exception as error:
+                            logger.debug(f"Retention cache cleanup deferred: {error}")
+                    self._manager_header_mem.pop(chat.id, None)
+                    self._waiting_ack_mem.pop(chat.id, None)
+                    if deleted:
+                        if self.ws_manager:
+                            await self.ws_manager.broadcast("chat_deleted", {"chat_id": chat.id})
+                        logger.info(f"Expired chat {chat.id} removed after {self._chat_retention_days} days")
+            except Exception as error:
+                logger.warning(f"Retention cleanup deferred for chat {candidate.id}: {error}")
+
     async def _run_auto_close(self):
         from datetime import datetime, timedelta, timezone as _tz
         from modules.database import Chat as ChatModel, Message as MessageModel
@@ -2112,7 +2196,8 @@ class SupportBot:
         reminder_delta = timedelta(minutes=self._auto_close_reminder_minutes)
         close_delta = timedelta(minutes=self._auto_close_after_minutes)
 
-        chats = await ChatModel.filter(status__in=["active", "waiting_manager"]).all()
+        # Пока клиент ждёт человека, напоминания и автозакрытие запрещены.
+        chats = await ChatModel.filter(status="active", ai_disabled=False).all()
         for chat in chats:
             try:
                 last_at = self._as_utc(chat.last_message_at)
@@ -2127,7 +2212,7 @@ class SupportBot:
                 if now - last_at < reminder_delta:
                     continue
                 # Напоминаем только если последнее слово не за клиентом
-                last_msg = await MessageModel.filter(chat_id=chat.id).order_by("-created_at").first()
+                last_msg = await MessageModel.filter(chat_id=chat.id, message_type__in=["user", "ai", "manager"]).exclude(source__in=["system", "ai_tool"]).order_by("-created_at", "-id").first()
                 if not last_msg or last_msg.message_type == "user":
                     continue
                 await self._send_inactivity_reminder(chat, now)
@@ -2135,39 +2220,58 @@ class SupportBot:
                 logger.warning(f"Auto-close check failed for chat {chat.id}: {e}")
 
     async def _send_inactivity_reminder(self, chat, now):
+        from datetime import timedelta
         from modules.database import Chat as ChatModel
-        try:
-            await self.application.bot.send_message(chat_id=chat.user_id, text=self._auto_close_reminder_text)
-        except Exception as e:
-            # Клиент недоступен (заблокировал бота и т.п.) — отметку всё равно ставим, чат закроется
-            logger.warning(f"Failed to send inactivity reminder to {chat.user_id}: {e}")
-        await ChatModel.filter(id=chat.id).update(reminder_sent_at=now)
-        try:
-            await self.db.add_message(chat.id, chat.user_id, "⏰ Клиенту отправлено напоминание о неактивности", "system")
-        except Exception:
-            pass
-        logger.info(f"Inactivity reminder sent for chat {chat.id}")
+        async with self._client_chat_lock(chat.user_id):
+            current = await ChatModel.get_or_none(id=chat.id)
+            if not current or current.status != "active" or current.ai_disabled:
+                return
+            if current.last_message_at != chat.last_message_at or current.reminder_sent_at:
+                return
+            last_at = self._as_utc(current.last_message_at)
+            if not last_at or now - last_at < timedelta(minutes=self._auto_close_reminder_minutes):
+                return
+            try:
+                await self.application.bot.send_message(chat_id=chat.user_id, text=self._auto_close_reminder_text)
+            except Exception as error:
+                logger.warning(f"Failed to send inactivity reminder to {chat.user_id}: {error}")
+            updated = await ChatModel.filter(
+                id=chat.id, status="active", ai_disabled=False,
+                last_message_at=current.last_message_at, reminder_sent_at=None,
+            ).update(reminder_sent_at=now)
+            if updated:
+                try:
+                    await self.db.add_message(chat.id, chat.user_id, "⏰ Клиенту отправлено напоминание о неактивности", "system")
+                except Exception:
+                    pass
+                logger.info(f"Inactivity reminder sent for chat {chat.id}")
 
     async def _auto_close_chat(self, chat):
-        logger.info(f"Auto-closing chat {chat.id} due to inactivity")
-        try:
-            # _close_chat уже переименовывает топик под статус "closed"
-            await self._close_chat(chat.id, 0, notify_text=self._auto_close_text, reason="автозакрытие по неактивности")
-        except Exception as e:
-            logger.warning(f"Auto-close failed for chat {chat.id}: {e}")
-            return
-        try:
-            if self._group_id and self.redis:
-                thread_id = self.redis.get(f"group_topic:chat:{chat.id}")
-                if thread_id:
+        from datetime import datetime, timedelta, timezone
+        async with self._client_chat_lock(chat.user_id):
+            current = await self.db.get_chat_by_id(chat.id)
+            if not current or current.status != "active" or current.ai_disabled:
+                return
+            if current.last_message_at != chat.last_message_at or current.reminder_sent_at != chat.reminder_sent_at:
+                return
+            reminder_at = self._as_utc(current.reminder_sent_at)
+            if not reminder_at or datetime.now(timezone.utc) - reminder_at < timedelta(minutes=self._auto_close_after_minutes):
+                return
+            logger.info(f"Auto-closing chat {chat.id} due to inactivity")
+            try:
+                await self._close_chat(chat.id, 0, notify_text=self._auto_close_text, reason="автозакрытие по неактивности")
+            except Exception as error:
+                logger.warning(f"Auto-close failed for chat {chat.id}: {error}")
+                return
+            if self._group_id and current.topic_id:
+                try:
                     await self.application.bot.send_message(
-                        chat_id=self._group_id,
+                        chat_id=current.topic_group_id or self._group_id,
                         text=f"🟢 Чат #{chat.id} закрыт автоматически (клиент не ответил)",
-                        message_thread_id=int(thread_id),
-                        disable_notification=True,
+                        message_thread_id=current.topic_id, disable_notification=True,
                     )
-        except Exception as e:
-            logger.warning(f"Failed to update topic on auto-close: {e}")
+                except Exception as error:
+                    logger.warning(f"Failed to update topic on auto-close: {error}")
 
     async def _maybe_send_weekly_report(self):
         """Еженедельный отчет админам: по понедельникам после 06:00 UTC (09:00 МСК)"""
@@ -2355,12 +2459,9 @@ class SupportBot:
         if msg.text and not msg.caption:
             return {"kind": "text", "text": msg.text, "file_id": None, "message_id": msg.message_id}
         if msg.photo:
-            # Для AI-vision берем размер до ~800px (меньше токенов), для пересылки хватает
-            photo = msg.photo[0]
-            for size in msg.photo:
-                if (size.width or 0) <= 800:
-                    photo = size
-            return {"kind": "photo", "text": msg.caption or "", "file_id": photo.file_id, "message_id": msg.message_id}
+            # Скриншоты с мелким текстом читаем в полном доступном разрешении.
+            photo = msg.photo[-1]
+            return {"kind": "photo", "text": msg.caption or "", "file_id": photo.file_id, "mime_type": "image/jpeg", "message_id": msg.message_id}
         if msg.video:
             return {"kind": "video", "text": msg.caption or "", "file_id": msg.video.file_id, "message_id": msg.message_id}
         if msg.audio:
@@ -2368,7 +2469,9 @@ class SupportBot:
         if msg.voice:
             return {"kind": "voice", "text": msg.caption or "", "file_id": msg.voice.file_id, "message_id": msg.message_id}
         if msg.document:
-            return {"kind": "document", "text": msg.caption or "", "file_id": msg.document.file_id, "message_id": msg.message_id}
+            return {"kind": "document", "text": msg.caption or "", "file_id": msg.document.file_id,
+                    "mime_type": msg.document.mime_type or "", "file_name": msg.document.file_name or "",
+                    "message_id": msg.message_id}
         if msg.video_note:
             return {"kind": "video_note", "text": "", "file_id": msg.video_note.file_id, "message_id": msg.message_id}
         return {"kind": "unknown", "text": msg.caption or msg.text or "", "file_id": None, "message_id": msg.message_id}
@@ -2383,24 +2486,25 @@ class SupportBot:
         if not self.redis:
             return None
         key = f"reply_map:{manager_id}:{replied_message_id}"
-        val = self.redis.get(key)
-        if not val:
-            return None
         try:
-            return json.loads(val)
+            val = self.redis.get(key)
+            return json.loads(val) if val else None
         except Exception:
             return None
 
     def _set_manager_active_chat(self, manager_id: int, chat_id: int):
         if not self.redis:
             return
-        self.redis.setex(f"manager_active_chat:{manager_id}", 24 * 3600, str(chat_id))
+        try:
+            self.redis.setex(f"manager_active_chat:{manager_id}", 24 * 3600, str(chat_id))
+        except Exception as error:
+            logger.warning(f"Manager cache unavailable: {error}")
 
     def _get_manager_active_chat(self, manager_id: int) -> Optional[int]:
         if not self.redis:
             return None
-        val = self.redis.get(f"manager_active_chat:{manager_id}")
         try:
+            val = self.redis.get(f"manager_active_chat:{manager_id}")
             return int(val) if val else None
         except Exception:
             return None
@@ -2455,6 +2559,9 @@ class SupportBot:
                 logger.warning(f"Telegram file too large for AI processing: {f.file_size}")
                 return None
             data = await f.download_as_bytearray()
+            if len(data) > max_size:
+                logger.warning("Downloaded Telegram file exceeds AI size limit")
+                return None
             return bytes(data)
         except Exception as e:
             logger.warning(f"Failed to download telegram file: {e}")
@@ -2470,15 +2577,36 @@ class SupportBot:
         filename = "voice.mp4" if info.get("kind") == "video_note" else "voice.ogg"
         return await self.ai.transcribe_audio(data, filename)
 
+    @staticmethod
+    def _is_image_info(info: dict) -> bool:
+        if info.get("kind") == "photo":
+            return True
+        if info.get("kind") != "document":
+            return False
+        mime = str(info.get("mime_type") or "").lower()
+        name = str(info.get("file_name") or "").lower()
+        return mime in {"image/jpeg", "image/png", "image/webp", "image/gif"} or name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+
     async def _photo_to_data_url(self, info: dict):
-        """Фото -> data URL для vision-модели"""
+        """Фото или документ-картинка -> data URL без Telegram URL/токена бота."""
         if not info.get("file_id"):
             return None
         data = await self._download_tg_file(info["file_id"], max_size=10 * 1024 * 1024)
         if not data:
             return None
+        if data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            mime = "image/webp"
+        elif data.startswith((b"GIF87a", b"GIF89a")):
+            mime = "image/gif"
+        else:
+            logger.warning("Unsupported Telegram image content")
+            return None
         import base64
-        return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+        return f"data:{mime};base64," + base64.b64encode(data).decode()
 
     async def _get_or_create_manager_header(self, client_chat_id: int, chat_id: int) -> Optional[int]:
         """Заголовок '👨‍💼 Менеджер поддержки' для режима session_header: отправляется
@@ -2648,87 +2776,99 @@ class SupportBot:
         except Exception:
             return f"{emoji} {data['first_name']} ({data['user_id']}) {data['status_label']}".strip()
 
+    def _cache_group_topic(self, chat_id: int, thread_id: int):
+        if self.redis:
+            try:
+                self.redis.set(f"group_topic:chat:{chat_id}", str(thread_id))
+                self.redis.set(f"group_topic:thread:{self._group_id}:{thread_id}", str(chat_id))
+            except Exception as error:
+                logger.warning(f"Topic cache unavailable: {error}")
+
     async def _ensure_group_topic(self, chat) -> Optional[int]:
         await self.refresh_runtime_settings()
         if not self._group_id:
             return None
-        thread_key = f"group_topic:chat:{chat.id}"
-        thread_id = self.redis.get(thread_key) if self.redis else None
-        if thread_id:
-            try:
-                return int(thread_id)
-            except:
-                pass
-        name = self._format_topic_title(chat, None)
-        try:
-            topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
-            thread_id = getattr(topic, "message_thread_id", None)
-        except Exception as e:
-            logger.error(f"Failed to create forum topic: {e}")
+        # БД — источник привязки. Redis может очищаться или быть недоступен.
+        thread_id = getattr(chat, "topic_id", None)
+        stored_group = getattr(chat, "topic_group_id", None)
+        if stored_group and stored_group != self._group_id:
             thread_id = None
-        if thread_id and self.redis:
-            self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
-            self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
-        if thread_id:
+        if not thread_id and not stored_group and self.redis:
             try:
-                from modules.database import Chat as ChatModel
-                await ChatModel.filter(id=chat.id).update(topic_id=thread_id)
+                cached = self.redis.get(f"group_topic:chat:{chat.id}")
+                thread_id = int(cached) if cached else None
             except Exception:
                 pass
-        return thread_id
-    
+        if thread_id:
+            self._cache_group_topic(chat.id, int(thread_id))
+            if not stored_group or not getattr(chat, "topic_id", None):
+                from modules.database import Chat as ChatModel
+                await ChatModel.filter(id=chat.id).update(topic_id=thread_id, topic_group_id=self._group_id)
+                chat.topic_id, chat.topic_group_id = thread_id, self._group_id
+            return int(thread_id)
+        return await self._recreate_group_topic(chat)
+
     async def _recreate_group_topic(self, chat, role_hint: Optional[str] = None) -> Optional[int]:
         await self.refresh_runtime_settings()
+        if not self._group_id:
+            return None
         name = self._format_topic_title(chat, role_hint)
         try:
             topic = await self.application.bot.create_forum_topic(chat_id=self._group_id, name=name)
             thread_id = getattr(topic, "message_thread_id", None)
-        except Exception as e:
-            logger.error(f"Failed to recreate forum topic: {e}")
+        except Exception as error:
+            logger.error(f"Failed to create forum topic: {error}")
             return None
-        if self.redis and thread_id:
-            self.redis.set(f"group_topic:chat:{chat.id}", str(thread_id))
-            self.redis.set(f"group_topic:thread:{thread_id}", str(chat.id))
-            self.redis.delete(f"group_topic:pin:{thread_id}")
         if thread_id:
-            try:
-                from modules.database import Chat as ChatModel
-                await ChatModel.filter(id=chat.id).update(topic_id=thread_id)
-            except Exception:
-                pass
+            from modules.database import Chat as ChatModel
+            await ChatModel.filter(id=chat.id).update(topic_id=thread_id, topic_group_id=self._group_id)
+            old_thread = getattr(chat, "topic_id", None)
+            chat.topic_id, chat.topic_group_id = thread_id, self._group_id
+            self._cache_group_topic(chat.id, thread_id)
+            if self.redis and old_thread and old_thread != thread_id:
+                try:
+                    self.redis.delete(f"group_topic:thread:{self._group_id}:{old_thread}", f"group_topic:pin:{self._group_id}:{old_thread}", f"group_topic:name:{self._group_id}:{old_thread}")
+                except Exception:
+                    pass
         return thread_id
 
     async def _edit_group_topic_status(self, chat, role_hint: Optional[str] = None):
         await self.refresh_runtime_settings()
-        if not self._group_id or not self.redis:
+        if not chat or not self._group_id:
             return
-        thread_id = self.redis.get(f"group_topic:chat:{chat.id}")
+        if getattr(chat, "topic_group_id", None) not in (None, self._group_id):
+            return
+        thread_id = getattr(chat, "topic_id", None)
+        if not thread_id and self.redis:
+            try:
+                thread_id = self.redis.get(f"group_topic:chat:{chat.id}")
+            except Exception:
+                pass
         if not thread_id:
             return
         try:
             name = self._format_topic_title(chat, role_hint)
-            # Cache name to avoid Topic_not_modified
-            cache_key = f"group_topic:name:{thread_id}"
-            last_name = self.redis.get(cache_key)
+            cache_key = f"group_topic:name:{self._group_id}:{thread_id}"
+            try:
+                last_name = self.redis.get(cache_key) if self.redis else None
+            except Exception:
+                last_name = None
             if last_name == name:
                 return
             await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(thread_id), name=name)
-            self.redis.set(cache_key, name)
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "topic_not_modified" in err_msg:
+            if self.redis:
+                try:
+                    self.redis.set(cache_key, name)
+                except Exception:
+                    pass
+        except Exception as error:
+            message = str(error).lower()
+            if "topic_not_modified" in message:
                 return
-            if any(s in err_msg for s in ["topic_deleted", "thread not found", "invalid thread"]):
-                new_thread = await self._recreate_group_topic(chat, role_hint)
-                if new_thread:
-                    try:
-                        name = self._format_topic_title(chat, role_hint)
-                        await self.application.bot.edit_forum_topic(chat_id=self._group_id, message_thread_id=int(new_thread), name=name)
-                        self.redis.set(f"group_topic:name:{new_thread}", name)
-                    except Exception as e2:
-                        logger.warning(f"Failed to edit recreated forum topic: {e2}")
+            if any(marker in message for marker in ["topic_deleted", "thread not found", "invalid thread", "message_thread_not_found"]):
+                await self._recreate_group_topic(chat, role_hint)
             else:
-                logger.warning(f"Failed to edit forum topic: {e}")
+                logger.warning(f"Failed to edit forum topic: {error}")
 
     async def _duplicate_to_group(self, chat, user, info: dict, update: Update, role_hint: Optional[str] = None):
         thread_id = await self._ensure_group_topic(chat)
@@ -2736,7 +2876,7 @@ class SupportBot:
             return
         try:
             mute = chat.status != "waiting_manager"
-            pin_key = f"group_topic:pin:{thread_id}"
+            pin_key = f"group_topic:pin:{self._group_id}:{thread_id}"
             pinned_id = self.redis.get(pin_key) if self.redis else None
             reply_to_id = None
             if not pinned_id:
@@ -2785,7 +2925,7 @@ class SupportBot:
                     return
                 try:
                     mute = chat.status != "waiting_manager"
-                    pin_key = f"group_topic:pin:{new_thread}"
+                    pin_key = f"group_topic:pin:{self._group_id}:{new_thread}"
                     pinned_id = self.redis.get(pin_key) if self.redis else None
                     reply_to_id = None
                     if not pinned_id:
@@ -2893,27 +3033,9 @@ class SupportBot:
                 return
             if user_id not in self.config.get_all_staff_ids():
                 return
-            replied = update.message.reply_to_message.message_id if update.message and update.message.reply_to_message else None
-            route = None
-            if replied and self.redis:
-                val = self.redis.get(f"group_reply:{self._group_id}:{replied}")
-                if val:
-                    try:
-                        route = json.loads(val)
-                    except:
-                        route = None
-            client_chat_id = None
-            chat_id = None
-            if route:
-                client_chat_id = route["client_chat_id"]
-                chat_id = route["chat_id"]
-            else:
-                if self.redis:
-                    cid = self.redis.get(f"group_topic:thread:{thread_id}")
-                    chat_id = int(cid) if cid else None
-                if chat_id:
-                    chat = await self.db.get_chat_by_id(chat_id)
-                    client_chat_id = chat.user_id if chat else None
+            chat = await self._chat_from_topic(update)
+            chat_id = chat.id if chat else None
+            client_chat_id = chat.user_id if chat else None
             if not client_chat_id or not chat_id:
                 await update.message.reply_text("❌ Не найден связанный клиент для этого топика.")
                 return
@@ -2963,10 +3085,7 @@ class SupportBot:
             else:
                 await update.message.reply_text("💬 Используйте команду /chats и подключитесь к чату, затем ответьте на пересланное сообщение.")
             return
-        chat = await self.db.get_chat_by_user_id(user_id)
-        if not chat:
-            chat = await self.db.create_chat(user_id=user_id, username=user.username, first_name=user.first_name, last_name=user.last_name)
-        saved_msg = await self._save_message_to_db(chat.id, user_id, info, "user")
+        chat, saved_msg = await self._save_client_message(user, info)
         if chat.status == "waiting_manager":
             try:
                 await self._forward_to_manager(chat, user, info, update)
@@ -2999,7 +3118,7 @@ class SupportBot:
                 await self._stop_typing(typing_stop, typing_task)
             if transcript:
                 question_text = transcript
-        elif info["kind"] == "photo" and self._ai_vision_enabled:
+        elif self._is_image_info(info) and self._ai_vision_enabled:
             typing_stop, typing_task = self._start_typing(update.effective_chat.id if update.effective_chat else user_id)
             try:
                 image_data_url = await self._photo_to_data_url(info)
@@ -3010,6 +3129,14 @@ class SupportBot:
                     "Клиент прислал изображение (вероятно, скриншот ошибки или экрана приложения). "
                     "Определи, что на нём изображено, и помоги решить проблему."
                 )
+            else:
+                await update.message.reply_text(
+                    "Не удалось прочитать изображение. Пришлите его ещё раз как фото или файл PNG, JPEG, WebP до 10 МБ. "
+                    "Можно также скопировать текст ошибки сюда."
+                )
+                return
+        elif (info.get("text") or "").strip():
+            question_text = info["text"]
 
         if transcript:
             # Сохраняем расшифровку в историю (веб-панель и контекст AI)
@@ -3047,9 +3174,9 @@ class SupportBot:
                 chat_history = [
                     {"role": "user" if msg.message_type == "user" else "assistant", "message": msg.content}
                     for msg in chat_messages
-                    if (getattr(msg, "source", None) or "") != "ai_tool"
+                    if msg.id != saved_msg.id and msg.message_type in {"user", "ai", "manager"} and getattr(msg, "source", None) not in {"system", "ai_tool"}
                 ]
-                context_info = {"user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
+                context_info = {"user_id": user_id, "chat_id": chat.id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name}
                 # Данные аккаунта клиента из Support API (баланс, подписки, ключи)
                 try:
                     account_info = await self.user_info.get_ai_context(user_id)
@@ -3069,7 +3196,7 @@ class SupportBot:
                 await self._send_pending_action_confirmation(update, chat, ai_response)
             elif ai_response:
                 await self._save_message_to_db(chat.id, user_id, {"kind": "text", "text": ai_response}, "ai")
-                if any(keyword in ai_response.lower() for keyword in ["менеджер", "пригласить", "подключить"]):
+                if should_offer_manager(ai_response, question_text):
                     keyboard = [[InlineKeyboardButton("Да, пригласите менеджера", callback_data=f"request_manager_{chat.id}")]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     await update.message.reply_text(self._md_to_html(ai_response), reply_markup=reply_markup, parse_mode=ParseMode.HTML)

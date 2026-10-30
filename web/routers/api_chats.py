@@ -602,7 +602,8 @@ async def ai_suggest_reply(chat_id: int, request: Request, user: AdminUser = Dep
     history = [
         {"role": "user" if m.message_type == "user" else "assistant", "message": getattr(m, "text", None) or m.content}
         for m in messages
-        if (getattr(m, "source", None) or "") != "ai_tool"
+        if m.message_type in {"user", "ai", "manager"} and getattr(m, "source", None) not in {"system", "ai_tool"}
+        and (not last_user_msg or m.id != last_user_msg.id)
     ]
     ctx = {"user_id": chat.user_id, "username": chat.username, "first_name": chat.first_name, "last_name": chat.last_name}
     try:
@@ -637,11 +638,11 @@ async def join_chat(request: Request, chat_id: int, user: AdminUser = Depends(ge
     chat.assigned_admin_id = user.id
     _edit_group_topic_background(bot, chat, role_hint="manager")
     try:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Менеджер подключился", source="system", text="Менеджер подключился")
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Менеджер подключился", source="system", text="Менеджер подключился")
     except Exception:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Менеджер подключился")
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Менеджер подключился")
     try:
-        await Chat.filter(id=chat_id).update(last_message_at=sysmsg.created_at, updated_at=sysmsg.created_at)
+        await Chat.filter(id=chat_id).update(updated_at=sysmsg.created_at)
     except Exception:
         pass
     _notify_client_background(bot, chat.user_id, "👨‍💼 Менеджер подключился к вашему чату. Можете писать сообщение.")
@@ -684,11 +685,11 @@ async def close_chat(request: Request, chat_id: int, user: AdminUser = Depends(g
     chat.assigned_admin_id = None
     _edit_group_topic_background(bot, chat, role_hint=None)
     try:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Чат закрыт. AI активирован", source="system", text="Чат закрыт. AI активирован", admin_user_id=user.id)
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Чат закрыт. AI активирован", source="system", text="Чат закрыт. AI активирован", admin_user_id=user.id)
     except Exception:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Чат закрыт. AI активирован")
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Чат закрыт. AI активирован")
     try:
-        await Chat.filter(id=chat_id).update(last_message_at=sysmsg.created_at, updated_at=sysmsg.created_at)
+        await Chat.filter(id=chat_id).update(updated_at=sysmsg.created_at)
     except Exception:
         pass
     bot._clear_manager_header(chat_id)
@@ -730,11 +731,11 @@ async def back_to_ai(request: Request, chat_id: int, user: AdminUser = Depends(g
     chat.ai_disabled = False
     _edit_group_topic_background(bot, chat, role_hint=None)
     try:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Менеджер завершил сессию. AI активирован", source="system", text="Менеджер завершил сессию. AI активирован", admin_user_id=user.id)
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Менеджер завершил сессию. AI активирован", source="system", text="Менеджер завершил сессию. AI активирован", admin_user_id=user.id)
     except Exception:
-        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="manager", content="Менеджер завершил сессию. AI активирован")
+        sysmsg = await Message.create(chat_id=chat_id, user_id=chat.user_id, message_type="system", content="Менеджер завершил сессию. AI активирован")
     try:
-        await Chat.filter(id=chat_id).update(last_message_at=sysmsg.created_at, updated_at=sysmsg.created_at)
+        await Chat.filter(id=chat_id).update(updated_at=sysmsg.created_at)
     except Exception:
         pass
     bot._clear_manager_header(chat_id)
@@ -766,22 +767,51 @@ async def delete_chat(chat_id: int, request: Request, user: AdminUser = Depends(
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     
-    from modules.database import Message, ManagerNotification
-    await Message.filter(chat_id=chat_id).delete()
-    await ManagerNotification.filter(chat_id=chat_id).delete()
-    
     bot = request.app.state.bot
-    if bot._group_id and getattr(bot, "redis", None):
-        thread_id = bot.redis.get(f"group_topic:chat:{chat.id}")
-        if thread_id:
+    from telegram.error import BadRequest
+    async with bot._client_chat_lock(chat.user_id):
+        chat = await Chat.get_or_none(id=chat_id)
+        if not chat:
+            return {"ok": True}
+        thread_id = chat.topic_id
+        group_id = chat.topic_group_id or bot._group_id
+        cache = getattr(bot, "redis", None)
+        if not thread_id and cache:
             try:
-                await bot.application.bot.delete_forum_topic(chat_id=bot._group_id, message_thread_id=int(thread_id))
+                cached = cache.get(f"group_topic:chat:{chat.id}")
+                thread_id = int(cached) if cached else None
             except Exception:
                 pass
-            bot.redis.delete(f"group_topic:chat:{chat.id}")
-            bot.redis.delete(f"group_topic:thread:{thread_id}")
-            bot.redis.delete(f"group_topic:name:{thread_id}")
-            bot.redis.delete(f"group_topic:pin:{thread_id}")
-
-    await chat.delete()
+        if thread_id:
+            if not group_id or not bot.application:
+                raise HTTPException(status_code=409, detail="Не настроена группа Telegram для удаления топика. Чат сохранён.")
+            try:
+                await bot.application.bot.delete_forum_topic(chat_id=group_id, message_thread_id=int(thread_id))
+            except BadRequest as error:
+                if not any(marker in str(error).lower() for marker in (
+                    "topic_deleted", "topic_id_invalid", "message_thread_not_found", "message thread not found",
+                    "thread not found", "topic not found",
+                )):
+                    raise HTTPException(status_code=502, detail="Не удалось удалить топик Telegram. Проверьте права бота; чат сохранён.") from error
+            except Exception as error:
+                raise HTTPException(status_code=502, detail="Telegram временно недоступен. Чат сохранён, повторите удаление позже.") from error
+        # FK cascades delete messages/notifications only after successful topic deletion.
+        await chat.delete()
+        if cache:
+            keys = [f"group_topic:chat:{chat.id}", f"manager_header:{chat.id}", f"waiting_ack:{chat.id}"]
+            if thread_id:
+                keys += [f"group_topic:thread:{thread_id}", f"group_topic:name:{thread_id}", f"group_topic:pin:{thread_id}",
+                         f"group_topic:thread:{group_id}:{thread_id}", f"group_topic:name:{group_id}:{thread_id}", f"group_topic:pin:{group_id}:{thread_id}"]
+            try:
+                cache.delete(*keys)
+                if chat.manager_id and bot._get_manager_active_chat(chat.manager_id) == chat.id:
+                    cache.delete(f"manager_active_chat:{chat.manager_id}")
+            except Exception:
+                pass
+        bot._manager_header_mem.pop(chat.id, None)
+        bot._waiting_ack_mem.pop(chat.id, None)
+    try:
+        await request.app.state.ws_manager.broadcast("chat_deleted", {"chat_id": chat_id})
+    except Exception:
+        pass
     return {"ok": True}

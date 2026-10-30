@@ -17,7 +17,7 @@ TOOL_PROTOCOL = re.compile(
     r"\b(?:get_payment_methods|get_available_payment_methods|create_payment(?:_link|_invoice)?|"
     r"check_payment|get_subscription_info|get_subscription_devices|reset_devices|"
     r"revoke_subscription|delete_device|remove_subscription_device|"
-    r"delete_subscription_device|remove_device)\b",
+    r"delete_subscription_device|remove_device|offer_manager|report_knowledge_gap)\b",
     re.IGNORECASE,
 )
 

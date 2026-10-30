@@ -2,14 +2,14 @@
   <div>
     <div style="margin-bottom: 12px;">
       <div style="font-size: 18px; font-weight: 700;">Автоматизация</div>
-      <div class="muted" style="font-size: 13px;">Автозакрытие неактивных чатов и SLA-контроль запросов менеджера</div>
+      <div class="muted" style="font-size: 13px;">Хранение истории, автозакрытие и контроль запросов менеджера</div>
     </div>
 
     <!-- Автозакрытие -->
     <div class="panel card" style="padding: 16px; border-radius: var(--app-radius); margin-bottom: 16px;">
       <div style="font-weight: 700; margin-bottom: 4px;">Автозакрытие неактивных чатов</div>
       <div class="muted" style="font-size: 13px; margin-bottom: 12px;">
-        Если клиент не отвечает после ответа бота или менеджера — сначала напоминание, затем автоматическое закрытие чата.
+        Если клиент не отвечает после ответа бота — сначала напоминание, затем закрытие. Пока приглашён менеджер или AI отключён, напоминания и автозакрытие не отправляются.
       </div>
       <div style="display:flex; flex-direction:column; gap:12px; max-width: 640px;">
         <div style="display:flex; align-items:center; gap:10px;">
@@ -37,6 +37,17 @@
       </div>
     </div>
 
+    <div class="panel card" style="padding: 16px; border-radius: var(--app-radius); margin-bottom: 16px;">
+      <div style="font-weight: 700; margin-bottom: 4px;">Хранение чатов и топиков</div>
+      <div class="muted" style="font-size: 13px; margin-bottom: 12px;">
+        Новый вопрос продолжает тот же диалог, даже если он был закрыт. Через указанный срок без сообщений
+        клиента, AI или менеджера история и Telegram-топик удаляются окончательно. Служебные уведомления срок не продлевают.
+      </div>
+      <label class="f-label">Дней без сообщений до удаления</label>
+      <InputText v-model="form.chat_retention_days" type="number" min="0" max="36500" style="width: 180px;" />
+      <div class="muted" style="font-size: 12px; margin-top: 6px;">По умолчанию 90 дней. 0 — хранить бессрочно. Проверка каждый час.</div>
+    </div>
+
     <!-- SLA -->
     <div class="panel card" style="padding: 16px; border-radius: var(--app-radius); margin-bottom: 16px;">
       <div style="font-weight: 700; margin-bottom: 4px;">SLA: контроль запросов менеджера</div>
@@ -59,7 +70,7 @@
     <div class="panel card" style="padding: 16px; border-radius: var(--app-radius); margin-bottom: 16px;">
       <div style="font-weight: 700; margin-bottom: 4px;">AI: голосовые, фото и отчёты</div>
       <div class="muted" style="font-size: 13px; margin-bottom: 12px;">
-        Расшифровка голосовых через Whisper и разбор скриншотов vision-моделью (нужен Groq-провайдер).
+        Расшифровка голосовых через Whisper и разбор фото, скриншотов и файлов изображений моделью с поддержкой зрения, в том числе OpenAI v2.
       </div>
       <div style="display:flex; flex-direction:column; gap:12px; max-width: 640px;">
         <div style="display:flex; align-items:center; gap:10px;">
@@ -98,6 +109,7 @@ import InputSwitch from 'primevue/inputswitch'
 import Textarea from 'primevue/textarea'
 
 const form = ref({
+  chat_retention_days: '90',
   auto_close_enabled: false,
   auto_close_reminder_minutes: '360',
   auto_close_after_minutes: '720',
@@ -118,6 +130,7 @@ async function load() {
   if (!res.ok) return
   const data = await res.json()
   const e = data.effective || {}
+  form.value.chat_retention_days = String(e.chat_retention_days ?? 90)
   form.value.auto_close_enabled = !!e.auto_close_enabled
   form.value.auto_close_reminder_minutes = String(e.auto_close_reminder_minutes ?? 360)
   form.value.auto_close_after_minutes = String(e.auto_close_after_minutes ?? 720)

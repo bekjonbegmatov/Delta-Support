@@ -149,7 +149,15 @@
             </div>
             <div class="field">
               <label class="field-label">Модель</label>
-              <InputText v-model="form.model_name" style="width: 100%" placeholder="Например: gpt-4o, claude-3-5-sonnet-20241022, gemini-1.5-flash" />
+              <Dropdown v-model="form.model_name" :options="visibleModels" optionLabel="label" optionValue="id"
+                        editable filter style="width: 100%" placeholder="Выберите модель или введите ID" :loading="modelsLoading" />
+              <div v-if="supportsDiscovery" class="model-actions">
+                <Button label="Обновить модели" icon="pi pi-refresh" text size="small" @click="fetchModels" :loading="modelsLoading" :disabled="!form.api_key && !currentId" />
+                <Button v-if="models.some(model => !model.likely_chat)" :label="showAllModels ? 'Только диалоговые' : 'Все модели'" text size="small" @click="showAllModels = !showAllModels" />
+              </div>
+              <small v-if="modelsError" class="model-error">{{ modelsError }} Можно ввести ID вручную.</small>
+              <small v-else-if="models.length" class="field-help">Список получен из API. Поддержку инструментов и изображений проверяйте для выбранной модели. Модель не меняется автоматически.</small>
+              <small v-else class="field-help">Введите ключ: доступные модели загрузятся автоматически.</small>
             </div>
           </div>
         </div>
@@ -236,7 +244,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
 import Password from 'primevue/password'
@@ -244,6 +252,7 @@ import Dialog from 'primevue/dialog'
 import Tag from 'primevue/tag'
 import InputNumber from 'primevue/inputnumber'
 import InputSwitch from 'primevue/inputswitch'
+import Dropdown from 'primevue/dropdown'
 
 interface ProviderType {
   name: string
@@ -282,7 +291,7 @@ const testMessages = ref<Record<number, string>>({})
 
 const form = ref({
   name: '',
-  api_type: 'openai',
+  api_type: 'openai_v2',
   api_key: '',
   api_keys_array: [] as string[],
   base_url: '',
@@ -294,7 +303,53 @@ const form = ref({
 
 const activeProviders = computed(() => providers.value.filter(p => p.is_active).length)
 const totalApiKeys = computed(() => providers.value.reduce((sum, p) => sum + 1 + p.api_keys_count, 0))
-const isFormValid = computed(() => form.value.name && form.value.model_name)
+const isFormValid = computed(() => form.value.name.trim() && form.value.model_name.trim() && (isEditing.value || form.value.api_key.trim()))
+
+const models = ref<{ id: string; likely_chat: boolean }[]>([])
+const modelsLoading = ref(false)
+const modelsError = ref('')
+const showAllModels = ref(false)
+const supportsDiscovery = computed(() => ['openai_v2', 'openai', 'groq', 'deepseek', 'mistral', 'openrouter'].includes(form.value.api_type))
+const visibleModels = computed(() => models.value.filter(model => showAllModels.value || model.likely_chat || model.id === form.value.model_name)
+  .map(model => ({ ...model, label: model.id + (model.likely_chat ? '' : ' · другая специализация') })))
+let modelsRequest = 0
+let modelsTimer: ReturnType<typeof setTimeout> | undefined
+
+const fetchModels = async () => {
+  if (!supportsDiscovery.value || (!form.value.api_key.trim() && !currentId.value)) return
+  if (modelsTimer) clearTimeout(modelsTimer)
+  const requestId = ++modelsRequest
+  modelsLoading.value = true
+  modelsError.value = ''
+  try {
+    const response = await fetch('/api/ai/providers/models', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider_id: currentId.value, api_type: form.value.api_type,
+        api_key: form.value.api_key, base_url: form.value.base_url })
+    })
+    const data = await response.json()
+    if (requestId !== modelsRequest) return
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось получить модели')
+    models.value = data.models || []
+    if (!models.value.length) modelsError.value = 'API вернул пустой список.'
+  } catch (error) {
+    if (requestId === modelsRequest) modelsError.value = error instanceof Error ? error.message : 'Не удалось получить модели'
+  } finally {
+    if (requestId === modelsRequest) modelsLoading.value = false
+  }
+}
+
+watch(() => [showModal.value, form.value.api_type, form.value.api_key, form.value.base_url, currentId.value], () => {
+  ++modelsRequest
+  models.value = []
+  modelsError.value = ''
+  modelsLoading.value = false
+  if (modelsTimer) clearTimeout(modelsTimer)
+  if (showModal.value && supportsDiscovery.value && (form.value.api_key.trim() || currentId.value)) {
+    modelsTimer = setTimeout(fetchModels, 800)
+  }
+})
+onUnmounted(() => { ++modelsRequest; if (modelsTimer) clearTimeout(modelsTimer) })
 
 const fetchProviders = async () => {
   const res = await fetch('/api/ai/providers', { credentials: 'include' })
@@ -351,7 +406,7 @@ const testApiKey = async (apiKey: string, index: number) => {
     
     const data = await res.json()
     testResults.value[index] = data.ok
-    testMessages.value[index] = data.message || 'Неизвестная ошибка'
+    testMessages.value[index] = data.message || data.detail || 'Неизвестная ошибка'
   } catch (e) {
     testResults.value[index] = false
     testMessages.value[index] = 'Ошибка сети'
@@ -364,41 +419,17 @@ const testProviderKey = async (provider: Provider) => {
   testingId.value = provider.id
   
   try {
-    // Получаем реальные данные провайдера
-    const res = await fetch(`/api/ai/providers/${provider.id}`, { credentials: 'include' })
-    if (!res.ok) {
-      alert('❌ Не удалось получить данные провайдера')
-      return
-    }
-    
-    const data = await res.json()
-    
-    if (!data.api_key) {
-      alert('⚠️ API ключ не установлен')
-      return
-    }
-    
-    testResults.value[0] = undefined
-    testMessages.value[0] = ''
-    
     const testRes = await fetch('/api/ai/providers/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({
-        api_type: data.api_type,
-        api_key: data.api_key,
-        base_url: data.base_url,
-        model_name: data.model_name
-      })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ provider_id: provider.id })
     })
-    
+
     const testData = await testRes.json()
     
     if (testData.ok) {
       alert(`✅ ${testData.message}`)
     } else {
-      alert(`❌ ${testData.message}`)
+      alert(`❌ ${testData.message || testData.detail}`)
     }
   } catch (e) {
     alert('❌ Ошибка сети')
@@ -411,11 +442,12 @@ const openCreateModal = () => {
   isEditing.value = false
   currentId.value = null
   showAdvanced.value = false
+  showAllModels.value = false
   testResults.value = {}
   testMessages.value = {}
   form.value = {
     name: '',
-    api_type: 'openai',
+    api_type: 'openai_v2',
     api_key: '',
     api_keys_array: [],
     base_url: '',
@@ -431,6 +463,7 @@ const editProvider = async (p: Provider) => {
   isEditing.value = true
   currentId.value = p.id
   showAdvanced.value = true
+  showAllModels.value = false
   testResults.value = {}
   testMessages.value = {}
   
@@ -527,6 +560,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.model-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.model-error { color: var(--red-500, #ef4444); display: block; }
+.field-help { display: block; margin-top: 5px; }
 .panel-header {
   display: flex;
   justify-content: space-between;
